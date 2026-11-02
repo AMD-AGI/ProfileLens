@@ -1,0 +1,34 @@
+diff --git a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp
+index 7b03fa3eb8..45df047284 100644
+--- a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp
++++ b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp
+@@ -536,11 +536,17 @@ cntrl_tracing_callback(rocprofiler_callback_tracing_record_t record,
+            record.operation == ROCPROFILER_MARKER_CONTROL_API_ID_roctxProfilerPause)
+         {
+             ROCPROFILER_CALL(rocprofiler_stop_context(*ctx), "pausing context");
++            if(tool::get_config().selected_regions && counter_collection_ctx.handle != 0)
++                ROCPROFILER_CALL(rocprofiler_stop_context(counter_collection_ctx),
++                                 "pausing counter collection");
+         }
+         else if(record.phase == ROCPROFILER_CALLBACK_PHASE_EXIT &&
+                 record.operation == ROCPROFILER_MARKER_CONTROL_API_ID_roctxProfilerResume)
+         {
+             ROCPROFILER_CALL(rocprofiler_start_context(*ctx), "resuming context");
++            if(tool::get_config().selected_regions && counter_collection_ctx.handle != 0)
++                ROCPROFILER_CALL(rocprofiler_start_context(counter_collection_ctx),
++                                 "resuming counter collection");
+         }
+ 
+         auto ts = rocprofiler_timestamp_t{};
+@@ -2241,7 +2247,10 @@ tool_init(rocprofiler_client_finalize_t fini_func, void* tool_data)
+                                                                      nullptr),
+             "Could not setup counting service");
+ 
+-        start_context(counter_collection_ctx, "counter collection");
++        // Under selected-regions, leave the counting context stopped at init and let
++        // roctxProfilerResume/Pause drive it
++        if(!tool::get_config().selected_regions)
++            start_context(counter_collection_ctx, "counter collection");
+     }
+ 
+     auto rename_ctx            = rocprofiler_context_id_t{0};
