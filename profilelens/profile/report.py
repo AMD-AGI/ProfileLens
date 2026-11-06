@@ -113,12 +113,20 @@ def _build_trace_context(
             if not name:
                 continue
             pct = (r.get("total_ms", 0) / total_ms * 100) if total_ms > 0 else 0
-            ctx[name] = {
+            entry = {
                 "e2e_pct": round(pct, 1),
                 "trace_total_ms": round(r.get("total_ms", 0), 3),
                 "trace_avg_ms": round(r.get("avg_ms", 0), 4),
                 "trace_count": r.get("count", 0),
             }
+            ctx[name] = entry
+            # Phase 1 trace names carry the ROCm ".kd"/"[clone .kd]" decoration
+            # that Phase 2 rocprofv3 dispatch names lack; register an undecorated
+            # alias so the kernel_name join (E2E%, trace timing) resolves either way.
+            from profilelens.profile.rocprofv3 import strip_kd_decoration
+            stripped = strip_kd_decoration(name)
+            if stripped != name:
+                ctx.setdefault(stripped, entry)
 
     gpu_time = _find_result(analysis_results, "CPU Op GPU Kernel Time")
     if gpu_time and gpu_time.rows:
