@@ -312,11 +312,30 @@ def build_command(
 
 
 def build_kernel_regex(kernel_names: list[str]) -> str:
-    """Build a regex that matches any of the given kernel names exactly."""
+    """Build a regex matching any of the given kernel names.
+
+    On ROCm the perfetto/kineto trace decorates GPU kernel names with a
+    kernel-descriptor suffix (trailing ``.kd`` and/or `` [clone .kd]``) that
+    rocprofv3's *dispatch* names do not carry. Matching the decorated name with
+    an anchored ``^(...)$`` therefore selects zero kernels for counter
+    collection (``--kernel-include-regex``), yielding an empty
+    ``*_counter_collection.csv``. Strip that decoration and allow it optionally
+    so the include-regex matches the runtime dispatch name.
+    """
     if not kernel_names:
         return ""
     import re as _re
-    return "^(" + "|".join(_re.escape(name) for name in kernel_names) + ")$"
+
+    def _norm(name: str) -> str:
+        n = _re.sub(r"\s*\[clone\s+\.kd\]\s*$", "", name)
+        n = _re.sub(r"\.kd\s*$", "", n)
+        return n
+
+    pats = [
+        _re.escape(_norm(name)) + r"(?:\.kd)?(?:\s*\[clone\s+\.kd\])?"
+        for name in kernel_names
+    ]
+    return "^(" + "|".join(pats) + ")$"
 
 
 def run_profile(
