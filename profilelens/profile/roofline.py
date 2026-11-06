@@ -131,11 +131,13 @@ def build_roofline_peaks_multi(
     dtypes: "list[str] | tuple[str, ...] | set[str]",
 ) -> dict[str, RooflinePeaks]:
     """Build a per-dtype roofline so each kernel sits on its own MFMA ceiling."""
-    from profilelens.profile.dtype_detect import counter_dtype
-
     out: dict[str, RooflinePeaks] = {}
     for dt in dtypes:
-        roof_dt = counter_dtype(dt)  # MXFP4 -> FP8, INT4 -> INT8, ...
+        # Map counter-family dtypes to benchmark operand types.
+        roof_dt = {"FP4": "F4", "MXFP4": "F4", "NVFP4": "F4",
+                   "FP6": "F6", "MXFP6": "F6", "MXFP8": "FP8",
+                   "F8": "FP8", "F16": "FP16", "F32": "FP32", "F64": "FP64",
+                   "INT4": "INT8"}.get(dt.upper(), dt)
         ceilings = parse_roofline_csv(csv_path, roof_dt)
         out[dt] = build_roofline_peaks(ceilings, gpu_model, dt)
     return out

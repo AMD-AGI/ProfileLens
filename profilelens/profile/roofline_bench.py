@@ -1,10 +1,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Empirical roofline peaks: fetch the rocprof-compute benchmark, run it, cache.
-
-Benchmark runner invokes as an isolated subprocess.
-"""
+"""Fetch, run and cache the rocprof-compute roofline benchmark."""
 
 from __future__ import annotations
 
@@ -18,14 +15,10 @@ from pathlib import Path
 
 from rich.console import Console
 
-# --- Acquire the benchmark source (sparse-fetch a pinned upstream commit, once) ---
-
-# Pinned ROCm/rocm-systems commit carrying the latest roofline benchmark.
 ROOFLINE_REPO = "https://github.com/ROCm/rocm-systems.git"
-# PR #6872 (https://github.com/ROCm/rocm-systems/pull/6872) fixed the gfx950 FP8 MFMA roofline; merged to develop as c0a7955.
+# rocm-systems PR #6872 (gfx950 FP8 MFMA roofline fix).
 ROOFLINE_REF = "c0a79552b50a959172bea2ed224ff9366f47681b"
 
-# Only these two subtrees are needed to run the benchmark.
 _SPARSE_PATHS = (
     "projects/rocprofiler-compute/src/roofline",
     "projects/rocprofiler-compute/src/utils",
@@ -34,8 +27,10 @@ _SRC_SUBDIR = "projects/rocprofiler-compute/src"
 
 
 def bench_cache_root() -> Path:
-    """Per-user cache root for fetched roofline benchmark code."""
-    return Path.home() / ".profilelens" / "roofline_bench"
+    """Cache root for fetched benchmark code under the current ProfileLens home."""
+    from profilelens.config import profilelens_home
+
+    return profilelens_home() / "roofline_bench"
 
 
 def bench_dir(ref: str = ROOFLINE_REF) -> Path:
@@ -118,8 +113,6 @@ def ensure_roofline_bench(
     return src
 
 
-# --- Orchestrate: run the benchmark via subprocess, cache per GPU model ---
-
 _ROOFLINE_RESULT_SCHEMA = "rpc-jit-gbps-v1"
 
 
@@ -151,7 +144,7 @@ def run_roofline_benchmark(
     force: bool = False,
     device_index: int = 0,
 ) -> Path:
-    """Run the roofline microbenchmark; cache per GPU model."""
+    """Run the roofline microbenchmark on an index in the visible device list."""
     csv_path = get_roofline_cache_path(cache_dir, gpu_model)
     if _result_cache_valid(csv_path) and not force:
         if console:
@@ -162,18 +155,14 @@ def run_roofline_benchmark(
     workload_dir = csv_path.parent
     os.makedirs(workload_dir, exist_ok=True)
 
-    # Invoke this module as a standalone script so the subprocess runs
-    # clean without importing profilelens
+    # Run as a script so the subprocess never imports profilelens.
     cmd = [
         sys.executable, str(Path(__file__).resolve()),
         "--src", str(bench_src),
-        "--device", "0",  # GPU is selected via HIP_VISIBLE_DEVICES below
+        "--device", str(device_index),
         "--out", str(csv_path),
     ]
     env = os.environ.copy()
-    env["HIP_VISIBLE_DEVICES"] = str(device_index)
-    env.pop("ROCR_VISIBLE_DEVICES", None)  # avoid HIP-index-out-of-range conflicts
-    env.pop("CUDA_VISIBLE_DEVICES", None)
 
     if console:
         console.print(
@@ -204,13 +193,10 @@ def run_roofline_benchmark(
     return csv_path
 
 
-# --- Subprocess runner: invoked as `python roofline_bench.py --src ... --out ...` ---
-
-
 def _install_vendored_yaml_shim() -> None:
     """Make ``from vendored import yaml`` resolve to system pyyaml."""
     try:
-        import yaml  # system pyyaml
+        import yaml
     except Exception as e:  # pragma: no cover
         raise SystemExit(f"pyyaml is required to run the roofline benchmark: {e}")
     mod = types.ModuleType("vendored")
@@ -240,7 +226,9 @@ def _run_benchmark_main() -> int:
     _install_vendored_yaml_shim()
 
     from roofline.run_benchmark import load_bench
+    from utils.hip_interface import hipSetDevice
 
+    hipSetDevice(args.device)
     bench = load_bench(args.device, {})
     bench.unsupported_data_types = list(
         getattr(bench, "unsupported_data_types", [])
@@ -252,14 +240,14 @@ def _run_benchmark_main() -> int:
 
 
 def use_fullrate_fp8(bench) -> None:
-    """On gfx950, measure FP8 via the full-rate 32x32x64 mfma_f8f6f4<FP8_E4M3> kernel, not the 32x32x16 path gfx942 uses."""
+    """On gfx950, select the existing full-rate FP8 kernel instead of gfx942's path."""
     if "32x32x64" not in getattr(bench, "matrix_f8f6f4_src", ""):
-        return  # not running on gfx950 
+        return
     if bench.matrix_kernel_selector.get("F8") != "mfma_f8":
-        return  # nothing to do
+        return
     bench.matrix_kernel_selector["F8"] = "mfma_f8f6f4<FP8_E4M3>"
-    bench.matrix_f8_src = bench.matrix_f8f6f4_src  # use the right benchmark
-    bench.matrix_ops["F8"] = bench.matrix_ops["F4"]  # full-rate factor
+    bench.matrix_f8_src = bench.matrix_f8f6f4_src
+    bench.matrix_ops["F8"] = bench.matrix_ops["F4"]
     print("[profilelens] FP8 roofline using mfma_f8f6f4<FP8_E4M3> (see PR #6872)")
 
 

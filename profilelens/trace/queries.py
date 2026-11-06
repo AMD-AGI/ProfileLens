@@ -7,7 +7,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from profilelens.dtypes import QueryResult
 
 
 @dataclass(frozen=True)
@@ -19,9 +22,6 @@ class PrebuiltQuery:
     description: str = ""
     internal: bool = False
 
-
-# Default queries
-# TODO: Add queries for memory bandwidth utilization and NCCL communication patterns
 
 TOP_SLOWEST_KERNELS = PrebuiltQuery(
     label="Top 10 Slowest GPU Kernels",
@@ -417,18 +417,7 @@ def build_category_summary(
     parent_chain_result: "QueryResult",
     id_names_result: "QueryResult",
 ) -> "QueryResult":
-    """Build a TraceLens-compatible category summary from parent-chain data.
-
-    Walks the CPU op call tree to attribute GPU kernel time to the
-    **outermost categorized ancestor**, matching how TraceLens's
-    ``TreePerfAnalyzer`` assigns ``op category``.
-
-    Args:
-        parent_chain_result: Result of ``CPU_OP_PARENT_CHAIN`` query.
-        id_names_result: Result of ``CPU_OP_ID_NAMES`` query -- all
-            cpu_op (id, name, parent_id) so we can resolve parents
-            that don't themselves launch GPU work.
-    """
+    """Attribute GPU time to each op's outermost categorized ancestor (TraceLens style)."""
     from profilelens.dtypes import QueryResult
     from profilelens.trace.categories import categorize_op, display_category
 

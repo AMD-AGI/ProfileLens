@@ -5,17 +5,23 @@
 
 from __future__ import annotations
 
+import math
+import statistics
 from typing import Any
 
 from profilelens.dtypes import KernelProfile, RooflinePeaks
+from profilelens.profile.counter_sets import DRAM_REQUEST_BYTE_COUNTERS
+from profilelens.profile.dtype_detect import UNKNOWN_DTYPE
 from profilelens.profile.parser import AggregatedKernel
 
-
-# empirical roofline peaks default
+# Sentinel for unavailable percentages.
 UNKNOWN_UTIL_PCT = -1.0
+MFMA_FLOAT_COUNTERS = tuple(
+    f"SQ_INSTS_VALU_MFMA_MOPS_{suffix}"
+    for suffix in ("BF16", "F16", "F8", "F6F4", "F32", "F64")
+)
 
-# Source: ROCm/rocprofiler-compute@rocm-7.2.4
-# analysis_configs/<arch>/1600_vector_l1_data_cache.yaml
+# Bytes/request from rocprofiler-compute rocm-7.2.4 (1600_vector_l1_data_cache.yaml).
 _CACHE_TRAFFIC_WIDTHS: dict[str, tuple[float, float, float]] = {
     "gfx942": (128.0, 128.0, 64.0),
     "gfx950": (128.0, 128.0, 64.0),
@@ -23,14 +29,14 @@ _CACHE_TRAFFIC_WIDTHS: dict[str, tuple[float, float, float]] = {
 
 
 _COLLECTIVE_PATTERNS = (
-    "cross_device",        # vllm::cross_device_reduce_*, aiter reduce_scatter_cross_device_store
+    "cross_device",
     "reduce_scatter",
     "all_reduce", "allreduce",
     "all_gather", "allgather",
     "all_to_all", "alltoall", "all2all",
     "reducescatter",
     "sendrecv", "send_recv",
-    "rccl", "nccl",        # ncclDevKernel_*, librccl device kernels
+    "rccl", "nccl",
 )
 
 
@@ -50,43 +56,75 @@ def _get(counters: dict[str, float], *keys: str) -> float:
     return 0.0
 
 
-def compute_mfma_flops(counters: dict[str, float], dtype: str | None) -> float:
-    """Compute MFMA FLOPS from counter values."""
-    # ROCprofiler-SDK 7.2.4 derived_counters.xml defines each
-    # SQ_INSTS_VALU_MFMA_MOPS_* unit as 512 operations.
-    if dtype:
-        from profilelens.profile.dtype_detect import mfma_counter_for_dtype
-        key = mfma_counter_for_dtype(dtype)
-        if key in counters:
-            return counters[key] * 512.0
-
-    total = 0.0
-    for suffix in ("BF16", "F16", "F8", "F32", "F64", "I8"):
-        total += _get(counters, f"SQ_INSTS_VALU_MFMA_MOPS_{suffix}") * 512.0
-    return total
+def _counter_sum(counters: dict[str, float], names: tuple[str, ...]) -> float:
+    values = [counters[name] for name in names]
+    if not all(math.isfinite(value) and value >= 0 for value in values):
+        raise ValueError(f"Counter values must be finite and nonnegative: {names}")
+    return sum(values)
 
 
-def compute_valu_flops(counters: dict[str, float], wave_size: int | None) -> float:
-    """Approximate VALU FLOPS using the runtime-reported wavefront width."""
-    if not wave_size or wave_size <= 0:
-        return 0.0
-    return _get(counters, "SQ_INSTS_VALU") * float(wave_size)
+def compute_mfma_flops_by_family(counters: dict[str, float]) -> dict[str, float]:
+    """Operations per collected MFMA family (512 ops per MOPS unit)."""
+    return {
+        name.removeprefix("SQ_INSTS_VALU_MFMA_MOPS_"): _counter_sum(counters, (name,)) * 512.0
+        for name in MFMA_FLOAT_COUNTERS if name in counters
+    }
+
+
+def compute_mfma_flops(counters: dict[str, float], dtype: str | None) -> float | None:
+    """Count only collected floating-point MFMA families; missing is not zero."""
+    families = compute_mfma_flops_by_family(counters)
+    return sum(families.values()) if families else None
+
+
+def compute_valu_lane_instructions(
+    counters: dict[str, float], wave_size: int | None
+) -> float | None:
+    """Untyped full-wave lane-instruction estimate, not floating-point work."""
+    if not wave_size or wave_size <= 0 or "SQ_INSTS_VALU" not in counters:
+        return None
+    return _counter_sum(counters, ("SQ_INSTS_VALU",)) * float(wave_size)
+
+
+def compute_hbm_bytes_by_kind(counters: dict[str, float]) -> dict[str, float]:
+    """Break down a complete SDK traffic source without inventing absent components."""
+    if all(name in counters for name in DRAM_REQUEST_BYTE_COUNTERS):
+        return {
+            kind: 32.0 * _counter_sum(counters, (name,))
+            for kind, name in zip(("read", "write", "atomic"), DRAM_REQUEST_BYTE_COUNTERS)
+        }
+
+    # The SDK reports FETCH_SIZE/WRITE_SIZE in KiB.
+    read = next((name for name in ("FETCH_SIZE", "FetchSize") if name in counters), None)
+    write = next((name for name in ("WRITE_SIZE", "WriteSize") if name in counters), None)
+    if read is None or write is None:
+        return {}
+    return {
+        "read": _counter_sum(counters, (read,)) * 1024.0,
+        "write": _counter_sum(counters, (write,)) * 1024.0,
+    }
 
 
 def compute_hbm_bytes(
     counters: dict[str, float], xcc_count: int | None = None
-) -> float:
+) -> float | None:
     """Read architecture-resolved HBM traffic from ROCprofiler-SDK metrics."""
-    if "BANDWIDTH_EA" in counters and xcc_count and xcc_count > 0:
-        active_cycles = _get(counters, "GRBM_GUI_ACTIVE")
-        return max(counters["BANDWIDTH_EA"] * active_cycles / xcc_count, 0.0)
+    components = compute_hbm_bytes_by_kind(counters)
+    return sum(components.values()) if components else None
 
-    # FETCH_SIZE and WRITE_SIZE are derived by the installed SDK in KiB. Their
-    # underlying raw-counter formulas vary by architecture, so ProfileLens must
-    # not duplicate those formulas or select them from a product-name table.
-    fetched_kib = _get(counters, "FETCH_SIZE", "FetchSize")
-    written_kib = _get(counters, "WRITE_SIZE", "WriteSize")
-    return max((fetched_kib + written_kib) * 1024.0, 0.0)
+
+def memory_traffic_source(counters: dict[str, float]) -> str:
+    if all(name in counters for name in DRAM_REQUEST_BYTE_COUNTERS):
+        return "sdk_dram_request_32b_units"
+    if compute_hbm_bytes(counters) is not None:
+        return "sdk_fetch_write_kib"
+    return "unavailable"
+
+
+def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
 
 
 def compute_l2_bytes(
@@ -155,6 +193,14 @@ def _bounded_pct(numerator: float, denominator: float) -> float:
 
 def compute_l1_hit_rate(counters: dict[str, float]) -> tuple[float, str]:
     """Return L1 hit percentage and counter value."""
+    direct = ("TCP_TOTAL_CACHE_ACCESSES_sum", "TCP_CACHE_MISS")
+    if all(name in counters for name in direct):
+        total = _counter_sum(counters, (direct[0],))
+        misses = _counter_sum(counters, (direct[1],))
+        if total <= 0 or misses > total:
+            return UNKNOWN_UTIL_PCT, "unavailable"
+        return (total - misses) / total * 100.0, "raw_direct_tcp_miss_request_ratio"
+
     required = (
         "TCP_TOTAL_CACHE_ACCESSES_sum",
         "TCP_TCC_READ_REQ_sum",
@@ -214,37 +260,37 @@ def _per_dispatch_roofline(
     arch: str,
 ) -> "dict[str, float | None] | None":
 
-    import statistics
-
     bws: list[float] = []
     tfs: list[float] = []
     ai_hbm: list[float] = []
     ai_l2: list[float] = []
     ai_l1: list[float] = []
+    valid_duration = False
     for counters, dur_ns in dispatches:
         if dur_ns <= 0:
             continue
+        valid_duration = True
         dur_s = dur_ns / 1e9
-        flops = compute_mfma_flops(counters, dtype) + compute_valu_flops(
-            counters, wave_size
-        )
+        flops = compute_mfma_flops(counters, dtype)
         hbm = compute_hbm_bytes(counters, xcc_count)
         l2 = compute_l2_bytes(counters, arch)
         l1 = compute_l1_bytes(counters, arch)
-        bws.append(hbm / dur_s)
-        tfs.append(flops / dur_s / 1e12)
-        if hbm > 0:
+        if hbm is not None:
+            bws.append(hbm / dur_s)
+        if flops is not None:
+            tfs.append(flops / dur_s / 1e12)
+        if flops is not None and hbm is not None and hbm > 0:
             ai_hbm.append(flops / hbm)
-        if l2 is not None and l2 > 0:
+        if flops is not None and l2 is not None and l2 > 0:
             ai_l2.append(flops / l2)
-        if l1 is not None and l1 > 0:
+        if flops is not None and l1 is not None and l1 > 0:
             ai_l1.append(flops / l1)
-    if not bws:
+    if not valid_duration:
         return None
     return {
-        "achieved_bw": statistics.median(bws),
-        "achieved_tflops": statistics.median(tfs),
-        "ai_hbm": statistics.median(ai_hbm) if ai_hbm else 0.0,
+        "achieved_bw": statistics.median(bws) if bws else None,
+        "achieved_tflops": statistics.median(tfs) if tfs else None,
+        "ai_hbm": statistics.median(ai_hbm) if ai_hbm else None,
         "ai_l2": statistics.median(ai_l2) if ai_l2 else None,
         "ai_l1": statistics.median(ai_l1) if ai_l1 else None,
     }
@@ -261,14 +307,25 @@ def compute_kernel_metrics(
     c = kernel.avg_counters
     has_counter_data = bool(c)
     dur_ns = kernel.avg_duration_ns
-    dur_s = dur_ns / 1e9 if dur_ns > 0 else 1e-15
+    dur_s = dur_ns / 1e9 if dur_ns > 0 else None
 
     wave_size = getattr(gpu_info, "wave_size", 0) if gpu_info else 0
     xcc_count = getattr(gpu_info, "xcc_count", 0) if gpu_info else 0
     arch = getattr(gpu_info, "arch", "") if gpu_info else ""
     mfma_flops = compute_mfma_flops(c, dtype)
-    valu_flops = compute_valu_flops(c, wave_size)
-    total_flops = mfma_flops + valu_flops
+    mfma_families = compute_mfma_flops_by_family(c)
+    mfma_fractions = ({family: operations / mfma_flops
+                       for family, operations in mfma_families.items()}
+                      if mfma_flops is not None and mfma_flops > 0 else {})
+    duration_samples_us = tuple(
+        duration_ns / 1000.0
+        for _counters, duration_ns in getattr(kernel, "dispatches", ())
+        if math.isfinite(duration_ns) and duration_ns > 0
+    )
+    valu_lane_instructions = compute_valu_lane_instructions(c, wave_size)
+    # Untyped VALU counts are not FP work.
+    valu_flops = None
+    total_flops = mfma_flops
 
     hbm_bytes = compute_hbm_bytes(c, xcc_count)
     l2_bytes = compute_l2_bytes(c, arch)
@@ -286,14 +343,13 @@ def compute_kernel_metrics(
         arch,
     )
 
-    ai_hbm = _safe_div(total_flops, hbm_bytes)
-    ai_l2 = total_flops / l2_bytes if l2_bytes is not None and l2_bytes > 0 else None
-    ai_l1 = total_flops / l1_bytes if l1_bytes is not None and l1_bytes > 0 else None
+    ai_hbm = _ratio(total_flops, hbm_bytes)
+    ai_l2 = _ratio(total_flops, l2_bytes)
+    ai_l1 = _ratio(total_flops, l1_bytes)
 
-    achieved_bw = hbm_bytes / dur_s if dur_s > 0 else 0.0
-    achieved_tflops = total_flops / dur_s / 1e12 if dur_s > 0 else 0.0
-    achieved_bw_tbps = achieved_bw / 1e12
-
+    achieved_bw = _ratio(hbm_bytes, dur_s)
+    achieved_tflops = _ratio(_ratio(total_flops, dur_s), 1e12)
+    achieved_bw_tbps = _ratio(achieved_bw, 1e12)
 
     _pd = _per_dispatch_roofline(
         getattr(kernel, "dispatches", ()), dtype, wave_size, xcc_count, arch
@@ -302,48 +358,34 @@ def compute_kernel_metrics(
         ai_hbm = _pd["ai_hbm"]
         ai_l2 = _pd["ai_l2"]
         ai_l1 = _pd["ai_l1"]
-        achieved_bw = float(_pd["achieved_bw"])
-        achieved_tflops = float(_pd["achieved_tflops"])
-        achieved_bw_tbps = achieved_bw / 1e12
+        achieved_bw = _pd["achieved_bw"]
+        achieved_tflops = _pd["achieved_tflops"]
+        achieved_bw_tbps = _ratio(achieved_bw, 1e12)
 
     if roofline_peaks is not None:
         peak_bw_tbps = roofline_peaks.peak_bw_tbps.get("hbm", 0.0)
         peak_mfma_tflops = roofline_peaks.peak_compute_tflops.get("mfma", 0.0)
-        if peak_mfma_tflops <= 0:
-            peak_mfma_tflops = roofline_peaks.peak_compute_tflops.get("valu", 0.0)
         peak_bw = peak_bw_tbps * 1e12
         peak_tflops = peak_mfma_tflops * 1e12
     else:
         peak_bw = 0.0
         peak_tflops = 0.0
 
-    if has_counter_data and peak_tflops > 0 and dur_s > 0:
-        mfma_util = _safe_div(mfma_flops / dur_s, peak_tflops) * 100.0
+    if dtype == UNKNOWN_DTYPE:
+        peak_tflops = 0.0
+    if achieved_tflops is not None and peak_tflops > 0:
+        mfma_util = achieved_tflops * 1e12 / peak_tflops * 100.0
     else:
         mfma_util = UNKNOWN_UTIL_PCT
-    if has_counter_data and hbm_bytes > 0 and peak_bw > 0:
-        bw_util = _safe_div(achieved_bw, peak_bw) * 100.0
+    if achieved_bw is not None and peak_bw > 0:
+        bw_util = achieved_bw / peak_bw * 100.0
     else:
         bw_util = UNKNOWN_UTIL_PCT
 
-    grbm_active = _get(c, "GRBM_GUI_ACTIVE")
-
-    # Vector-ALU engine busy %, rocprof-compute's formula:
-    #   100 * SQ_ACTIVE_INST_VALU / CU_NUM / GRBM_GUI_ACTIVE
-    valu_busy_pct = -1.0
-    valu_active = _get(c, "SQ_ACTIVE_INST_VALU")
-    cu_count = getattr(gpu_info, "cu_count", 0) if gpu_info else 0
-    if valu_active > 0 and cu_count and grbm_active > 0:
-        valu_busy_pct = 100.0 * valu_active / cu_count / grbm_active
-
-    # Wavefront occupancy = time-averaged concurrent waves / max concurrent waves.
+    valu_busy_pct = c.get("VALUBusy", UNKNOWN_UTIL_PCT)
+    valu_lane_utilization_pct = c.get("VALUUtilization", UNKNOWN_UTIL_PCT)
     wave_cycles = _get(c, "SQ_WAVE_CYCLES")  # per-SE sum, units of 4 cycles
-    max_waves_per_cu = getattr(gpu_info, "max_waves_per_cu", 0) if gpu_info else 0
-    max_concurrent_waves = cu_count * max_waves_per_cu
-    if wave_cycles > 0 and grbm_active > 0 and max_concurrent_waves > 0:
-        occupancy = (wave_cycles * 4.0) / grbm_active / max_concurrent_waves * 100.0
-    else:
-        occupancy = UNKNOWN_UTIL_PCT
+    occupancy = c.get("OccupancyPercent", UNKNOWN_UTIL_PCT)
 
     l1_hit, l1_hit_source = compute_l1_hit_rate(c)
     l2_hit, l2_hit_source = compute_l2_hit_rate(c)
@@ -381,7 +423,7 @@ def compute_kernel_metrics(
 
     from profilelens.profile.bottleneck import classify_bottleneck, generate_gap_hints
     if is_collective_kernel(kernel.kernel_name):
-        # Cross-device communication: the single-GPU compute/HBM roofline does not apply.
+        # The single-GPU roofline does not apply to collectives.
         bottleneck = "COLLECTIVE"
         mfma_util = UNKNOWN_UTIL_PCT
         bw_util = UNKNOWN_UTIL_PCT
@@ -406,7 +448,15 @@ def compute_kernel_metrics(
             "dropped PMC samples. Re-run with rocprofv3 wrapping `vllm serve` "
             "directly to capture counters.",
         ]
-    elif mfma_util >= 0 and bw_util >= 0:
+    elif dtype == UNKNOWN_DTYPE:
+        bottleneck = "UNKNOWN"
+        hints = [
+            "Compute dtype is unresolved. Collected MFMA counters describe selected "
+            "instruction families, not necessarily all arithmetic; no datatype-specific "
+            "compute utilization, bottleneck or optimization headroom is inferred.",
+        ]
+    elif (mfma_util >= 0 and bw_util >= 0 and mfma_flops is not None
+          and mfma_flops > 0 and hbm_bytes is not None and hbm_bytes > 0):
         bottleneck = classify_bottleneck(mfma_util, bw_util)
         hints = generate_gap_hints(
             mfma_util, bw_util, occupancy, l1_hit, l2_hit,
@@ -414,7 +464,23 @@ def compute_kernel_metrics(
         )
     else:
         bottleneck = "UNKNOWN"
-        if roofline_peaks is not None and peak_bw > 0 and hbm_bytes <= 0:
+        if mfma_flops is None:
+            hints = [
+                "No floating-point MFMA-family counter was collected. Matrix "
+                "FLOPs and arithmetic intensity are unavailable, not measured zeros."
+            ]
+        elif mfma_flops == 0:
+            hints = [
+                "Collected floating-point MFMA counters are zero. A matrix "
+                "roofline does not classify this sample's unmeasured vector or "
+                "memory work. Measured bandwidth remains independently available."
+            ]
+        elif hbm_bytes is None:
+            hints = [
+                "Complete SDK memory-traffic counters were not collected. Memory "
+                "bytes, bandwidth and arithmetic intensity are unavailable."
+            ]
+        elif roofline_peaks is not None and peak_bw > 0 and hbm_bytes <= 0:
             hints = [
                 "No positive HBM traffic was reported for this kernel sample — "
                 "bandwidth utilization and roofline classification are N/A."
@@ -424,6 +490,13 @@ def compute_kernel_metrics(
                 "Empirical roofline peaks unavailable — re-run without --no-roofline "
                 "to enable utilization metrics."
             ]
+
+    if mfma_flops is not None:
+        hints.append(
+            "Matrix FLOPs sum only collected floating-point MFMA families and "
+            "include executed tile work. Uncollected families and other arithmetic "
+            "are not measured; untyped VALU lane-instruction estimates are excluded."
+        )
 
     return KernelProfile(
         kernel_name=kernel.kernel_name,
@@ -437,11 +510,11 @@ def compute_kernel_metrics(
         hbm_bytes=hbm_bytes,
         l2_bytes=l2_bytes,
         l1_bytes=l1_bytes,
-        ai_hbm=round(ai_hbm, 2),
-        ai_l2=round(ai_l2, 2) if ai_l2 is not None else None,
-        ai_l1=round(ai_l1, 2) if ai_l1 is not None else None,
-        achieved_bw_tbps=round(achieved_bw_tbps, 4),
-        achieved_tflops=round(achieved_tflops, 4),
+        ai_hbm=ai_hbm,
+        ai_l2=ai_l2,
+        ai_l1=ai_l1,
+        achieved_bw_tbps=achieved_bw_tbps,
+        achieved_tflops=achieved_tflops,
         mfma_util_pct=round(mfma_util, 1),
         bw_util_pct=round(bw_util, 1),
         occupancy_pct=round(occupancy, 1),
@@ -453,6 +526,12 @@ def compute_kernel_metrics(
         l1_bytes_source=l1_bytes_source,
         l2_bytes_source=l2_bytes_source,
         valu_busy_pct=round(valu_busy_pct, 1) if valu_busy_pct >= 0 else -1.0,
+        valu_lane_utilization_pct=(
+            round(valu_lane_utilization_pct, 1) if valu_lane_utilization_pct >= 0 else -1.0
+        ),
+        valu_lane_instructions=valu_lane_instructions,
+        mfma_counter_families=tuple(name for name in MFMA_FLOAT_COUNTERS if name in c),
+        hbm_bytes_source=memory_traffic_source(c),
         stall_issue_pct=round(stall_issue, 1) if stall_issue >= 0 else -1.0,
         stall_vmem_pct=round(stall_vmem, 1) if stall_vmem >= 0 else -1.0,
         stall_lds_pct=round(stall_lds, 1) if stall_lds >= 0 else -1.0,
@@ -463,4 +542,10 @@ def compute_kernel_metrics(
         dtype_source=dtype_source,
         shape_sig=kernel.shape_sig,
         variant_label=getattr(kernel, "variant_label", ""),
+        median_duration_us=(statistics.median(duration_samples_us)
+                            if duration_samples_us else None),
+        duration_samples_us=duration_samples_us,
+        mfma_flops_by_family=mfma_families,
+        mfma_fraction_by_family=mfma_fractions,
+        hbm_bytes_by_kind=compute_hbm_bytes_by_kind(c),
     )

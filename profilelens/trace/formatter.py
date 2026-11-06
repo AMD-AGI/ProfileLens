@@ -66,7 +66,6 @@ def format_markdown(results: list[QueryResult]) -> str:
         if not qr.rows:
             parts.append("_No results._\n")
             continue
-        # Header
         parts.append("| " + " | ".join(qr.columns) + " |")
         parts.append("| " + " | ".join("---" for _ in qr.columns) + " |")
         for row in qr.rows:

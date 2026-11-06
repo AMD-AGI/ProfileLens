@@ -8,8 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-# Trace Types
-
 
 @dataclass(frozen=True)
 class TraceInfo:
@@ -31,9 +29,6 @@ class QueryResult:
     error: str | None = None
 
 
-# Profiling Types
-
-
 @dataclass(frozen=True)
 class KernelProfile:
     """HW-counter-derived metrics for a single kernel."""
@@ -43,17 +38,17 @@ class KernelProfile:
     avg_duration_us: float
     total_duration_us: float
     detected_dtype: str
-    mfma_flops: float
-    valu_flops: float
-    total_flops: float
-    hbm_bytes: float
+    mfma_flops: float | None
+    valu_flops: float | None
+    total_flops: float | None
+    hbm_bytes: float | None
     l2_bytes: float | None
     l1_bytes: float | None
-    ai_hbm: float
+    ai_hbm: float | None
     ai_l2: float | None
     ai_l1: float | None
-    achieved_bw_tbps: float
-    achieved_tflops: float
+    achieved_bw_tbps: float | None
+    achieved_tflops: float | None
     mfma_util_pct: float
     bw_util_pct: float
     occupancy_pct: float
@@ -65,6 +60,10 @@ class KernelProfile:
     l1_bytes_source: str = "unavailable"
     l2_bytes_source: str = "unavailable"
     valu_busy_pct: float = -1.0
+    valu_lane_utilization_pct: float = -1.0
+    valu_lane_instructions: float | None = None
+    mfma_counter_families: tuple[str, ...] = ()
+    hbm_bytes_source: str = "unavailable"
     stall_issue_pct: float = -1.0
     stall_vmem_pct: float = -1.0
     stall_lds_pct: float = -1.0
@@ -75,6 +74,11 @@ class KernelProfile:
     dtype_source: str = "global"
     shape_sig: str = ""
     variant_label: str = ""
+    median_duration_us: float | None = None
+    duration_samples_us: tuple[float, ...] = ()
+    mfma_flops_by_family: dict[str, float] = field(default_factory=dict)
+    mfma_fraction_by_family: dict[str, float] = field(default_factory=dict)
+    hbm_bytes_by_kind: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -110,3 +114,6 @@ class ProfilingResult:
     peaks_by_dtype: dict[str, "RooflinePeaks"] = field(default_factory=dict)
     per_region_kernels: dict[str, tuple["KernelProfile", ...]] = field(default_factory=dict)
     trace_context_source: str = "perfetto_sql"
+    counter_dtype_hints: tuple[str, ...] = ()
+    counter_dtypes: tuple[str, ...] = ()
+    unresolved_kernels: tuple[str, ...] = ()

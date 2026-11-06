@@ -33,16 +33,7 @@ DEFAULT_LOAD_TIMEOUT = 300
 
 
 class TraceProc:
-    """Wraps ``perfetto.trace_processor.TraceProcessor`` for SQL queries.
-
-    Usage::
-
-        tp = TraceProc("trace.json")
-        result, err = tp.query("SELECT name, dur FROM slice LIMIT 5")
-
-        # Or connect to an already-running trace_processor_shell:
-        tp = TraceProc(addr="localhost:41503")
-    """
+    """Wrap Perfetto ``TraceProcessor`` for a trace file or a running server."""
 
     def __init__(self, trace_path: str | None = None, *, addr: str | None = None) -> None:
         if not trace_path and not addr:
@@ -110,8 +101,6 @@ class TraceProc:
         except AttributeError:
             return None
 
-    # Lazy loader
-
     @staticmethod
     def _bypass_proxy_for_localhost() -> dict[str, str | None]:
         """Temporarily allow localhost connections go direct."""
@@ -165,9 +154,6 @@ class TraceProc:
             msg = f"Failed to load trace: {exc}"
             logger.error(msg)
             return None, msg
-
-    # Public API
-    # TODO: Add method to run rocprofv3 on hottest kernels identified from trace
 
     _QUERY_RETRIES = 5
     _QUERY_RETRY_BASE = 0.5

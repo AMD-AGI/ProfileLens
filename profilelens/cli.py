@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from enum import Enum
 from pathlib import Path
@@ -33,9 +34,6 @@ class OutputFormat(str, Enum):
     rich = "rich"
     json = "json"
     markdown = "markdown"
-
-
-# Helpers
 
 
 def _validate_trace(path: str) -> TraceProc:
@@ -163,7 +161,9 @@ def _build_parent_chain(cpu_ext: "QueryResult", gpu_ext: "QueryResult") -> "Quer
     )
 
 
+from profilelens.profile._proc_utils import WorkloadTimeout as _WorkloadTimeout  # noqa: E402
 from profilelens.profile._proc_utils import reap_process_group as _reap_process_group
+from profilelens.profile._proc_utils import wait_with_watchdog as _wait_with_watchdog  # noqa: E402
 
 
 def _aggregate_phase_audit(audit_dir: Path) -> dict[str, int]:
@@ -196,9 +196,7 @@ def _output_results(results: list[QueryResult], fmt: OutputFormat) -> None:
 
 
 def _load_external_ranking(path: str) -> list[str]:
-    """External kernel ranking (most-important first), tool-agnostic. Accepts a
-    JSON list of names or ``{kernel_name|name}`` objects, or one name per line;
-    order preserved, dupes dropped."""
+    """Load an ordered, de-duplicated kernel ranking from JSON or plain text."""
     p = Path(path)
     if not p.exists():
         console.print(f"[bold red]Error:[/] ranking file not found: {path}")
@@ -220,7 +218,6 @@ def _load_external_ranking(path: str) -> list[str]:
             line = line.strip()
             if line and not line.startswith("#"):
                 names.append(line)
-    # Preserve order, drop blanks/dupes.
     seen: set[str] = set()
     ordered: list[str] = []
     for n in names:
@@ -231,9 +228,7 @@ def _load_external_ranking(path: str) -> list[str]:
 
 
 def _load_trace_context(path: str) -> dict:
-    """External per-kernel timing override (e.g. TraceLens). JSON list of
-    ``{kernel_name, total_us|total_ms, count?}`` -> ``{name: {total_ms, count}}``,
-    used to source reported E2E% from the upstream ranker."""
+    """Load external per-kernel timing (e.g. TraceLens) keyed by kernel name."""
     p = Path(path)
     if not p.exists():
         console.print(f"[bold red]Error:[/] trace-context file not found: {path}")
@@ -253,16 +248,23 @@ def _load_trace_context(path: str) -> dict:
             total_ms = float(it["total_us"]) / 1000.0
         else:
             continue
-        out[name] = {"total_ms": total_ms, "count": int(it.get("count") or 0)}
+        count = int(it.get("count") or 0)
+        out[name] = {
+            "total_ms": total_ms, "count": count,
+            "avg_ms": total_ms / count if count > 0 else 0.0,
+        }
+        if it.get("e2e_pct") is not None:
+            pct = float(it["e2e_pct"])
+            if not math.isfinite(pct) or pct < 0:
+                raise ValueError(f"Invalid external e2e_pct for {name}: {it['e2e_pct']}")
+            out[name]["e2e_pct"] = pct
     return out
 
 
 def _apply_external_trace_context(
     analysis_results: "list[QueryResult]", ext: dict
 ) -> "list[QueryResult]":
-    """Copy of ``analysis_results`` with the "Aggregate Time per Kernel Name"
-    result rebuilt from ``ext``. That single result feeds every E2E% computation,
-    so replacing it re-sources all reported time-share at once."""
+    """Replace the per-kernel aggregate result with external timing."""
     from dataclasses import replace as _replace
 
     if not ext:
@@ -271,7 +273,7 @@ def _apply_external_trace_context(
     for r in analysis_results:
         if r.label == "Aggregate Time per Kernel Name":
             rows = tuple(
-                {"name": name, "total_ms": v["total_ms"], "count": v["count"]}
+                {"name": name, **v}
                 for name, v in ext.items()
             )
             out.append(_replace(r, rows=rows))
@@ -286,11 +288,9 @@ def _derive_ranking_and_dtypes(
     dtype_dir: str | None = None,
     external_ranking: list[str] | None = None,
 ):
-    """Trace->profiling bridge -> ``(kernel_names, per_kernel_dtype,
-    observed_dtypes, dtype)``. ``external_ranking`` (e.g. TraceLens top-K) drives
-    selection; the trace analysis still drives sampling/dtype. ``dtype_dir`` =
-    Phase-1 shim sidecars for non-aten dtype."""
+    """Return (kernel_names, per_kernel_dtype, observed_dtypes, dtype) for profiling."""
     from profilelens.profile.dtype_detect import (
+        UNKNOWN_DTYPE,
         dtype_from_query_result,
         merge_dtype_sidecar,
         resolve_kernel_dtypes,
@@ -309,19 +309,42 @@ def _derive_ranking_and_dtypes(
             dtype = dtype_from_query_result(r.rows)
             break
     if dtype is None:
-        dtype = "BF16"
+        dtype = UNKNOWN_DTYPE
 
     sidecar = merge_dtype_sidecar(dtype_dir) if dtype_dir else {}
     trace_dtypes = build_kernel_dtype_from_trace(analysis_results)
     per_kernel_dtype, observed_dtypes = resolve_kernel_dtypes(
         kernel_names, sidecar, trace_dtypes, global_dtype=dtype,
     )
-    if observed_dtypes:
+    if UNKNOWN_DTYPE in observed_dtypes:
+        dtype = UNKNOWN_DTYPE
+    elif observed_dtypes:
         dtype = observed_dtypes[0]
     return kernel_names, per_kernel_dtype, observed_dtypes, dtype
 
 
-# Commands
+def _counter_options(counter_set: str, counters: str | None, dtypes: str | None):
+    """Parse measurement configuration independently of dtype attribution."""
+    from profilelens.profile.dtype_detect import normalize_counter_dtype_hints
+
+    if counter_set not in {"auto", "custom"}:
+        raise typer.BadParameter("--counter-set must be auto or custom")
+    names = list(dict.fromkeys(c.strip() for c in (counters or "").split(",") if c.strip()))
+    if counters is not None and not names:
+        raise typer.BadParameter("--counters must contain at least one counter name")
+    if names:
+        counter_set = "custom"
+    elif counter_set == "custom":
+        raise typer.BadParameter("--counter-set custom requires --counters")
+    try:
+        hints = normalize_counter_dtype_hints(
+            [dt.strip() for dt in (dtypes or "").split(",") if dt.strip()]
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if dtypes is not None and not hints:
+        raise typer.BadParameter("--dtypes must contain at least one dtype")
+    return counter_set, names or None, hints
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -335,16 +358,33 @@ def profile(
     dtype_dir: Optional[str] = typer.Option(None, "--dtype-dir", help="Directory of Phase-1 shim dtype sidecars (PROFILELENS_DTYPE_DIR) for dtype-aware counter selection of non-aten kernels."),
     top_k: int = typer.Option(10, "--top-k", help="Number of top kernels from analysis."),
     counter_set: str = typer.Option("auto", "--counter-set", help="Counter preset: auto or custom."),
-    counters: Optional[str] = typer.Option(None, "--counters", help="Custom counter list (comma-separated, requires --counter-set custom)."),
+    counters: Optional[str] = typer.Option(None, "--counters", help="Explicit counter names, comma-separated. Selects the custom counter set; requires single-pass SDK compatibility."),
+    dtypes: Optional[str] = typer.Option(None, "--dtypes", help="Comma-separated counter-coverage hints, e.g. BF16,FP8,FP4. Does not assign a dtype to unresolved kernels."),
     run_roofline: bool = typer.Option(True, "--run-roofline/--no-roofline", help="Run roofline microbenchmark."),
     refresh_roofline: bool = typer.Option(False, "--refresh-roofline", help="Force re-run of roofline benchmark."),
     sample_dispatches: int = typer.Option(10, "--sample-dispatches", help="Dispatches to sample per kernel (0 = profile all)."),
     output_dir: str = typer.Option("./profilelens_run", "--output-dir", help="Output directory."),
     output: OutputFormat = typer.Option(OutputFormat.rich, "--output", "-o", help="Output format."),
+    workload_timeout: float = typer.Option(
+        0.0, "--workload-timeout",
+        help="Total seconds to allow the workload to run; 0 (the default) means "
+             "no limit -- profiler should not cap how long your workload legitimately takes to complete.",
+    ),
+    workload_idle_timeout: float = typer.Option(
+        1800.0, "--workload-idle-timeout",
+        help="Stop the workload if it makes no progress, no CPU time and no new "
+             "output for this many seconds; 0 disables. Catches deadlocks "
+             "without stopping long-running work.",
+    ),
 ) -> None:
     """Profile GPU kernels with HW counters and empirical roofline analysis."""
-    from profilelens.profile.runner import extract_top_k_kernels, run_profile as _run
-    from profilelens.profile.dtype_detect import dtype_from_analysis_json
+
+    counter_set, custom_ctr, counter_dtype_hints = _counter_options(counter_set, counters, dtypes)
+
+    output_dir = os.path.abspath(output_dir)
+    dtype_dir = os.path.abspath(dtype_dir) if dtype_dir else None
+    rank_from = os.path.abspath(rank_from) if rank_from else None
+    from profilelens.profile.runner import run_profile as _run
     from profilelens.profile.report import (
         format_profiling_json,
         format_profiling_markdown,
@@ -364,11 +404,9 @@ def profile(
     observed_dtypes: list[str] | None = None
 
     if trace:
-        # Reuse a collected trace; top-K selection may be delegated via --rank-from.
         lens = _validate_trace(trace)
         console.print(f"  Analyzing supplied trace: {Path(trace).name}")
         analysis_results = _run_profiling_queries(lens)
-        # Optionally source E2E% from an upstream ranker instead of Perfetto SQL.
         if trace_context_from:
             ext_tc = _load_trace_context(trace_context_from)
             analysis_results = _apply_external_trace_context(analysis_results, ext_tc)
@@ -389,9 +427,10 @@ def profile(
             f"observed dtypes: {', '.join(observed_dtypes) or dtype}"
         )
     elif from_analysis:
-        names = extract_top_k_kernels(from_analysis, top_k)
-        dtype = dtype_from_analysis_json(from_analysis)
         analysis_results = load_analysis_results(from_analysis) or None
+        names, per_kernel_dtype, observed_dtypes, dtype = _derive_ranking_and_dtypes(
+            analysis_results or [], top_k, dtype_dir=dtype_dir,
+        )
         if not names:
             console.print("[bold red]Error:[/] no kernels found in analysis output")
             raise typer.Exit(1)
@@ -421,8 +460,6 @@ def profile(
         "roofline_cache_dir": cfg.profiling.roofline_cache_dir,
     }
 
-    custom_ctr = [c.strip() for c in counters.split(",") if c.strip()] if counters else None
-
     try:
         result = _run(
             kernel_names=names,
@@ -430,6 +467,7 @@ def profile(
             dtype=dtype,
             counter_set_mode=counter_set,
             custom_counters=custom_ctr,
+            counter_dtype_hints=counter_dtype_hints,
             run_roofline=run_roofline,
             refresh_roofline=refresh_roofline,
             output_dir=output_dir,
@@ -440,12 +478,13 @@ def profile(
             profiling_config=profiling_cfg,
             per_kernel_dtype=per_kernel_dtype,
             observed_dtypes=observed_dtypes,
+            workload_timeout=workload_timeout,
+            workload_idle_timeout=workload_idle_timeout,
         )
     except RuntimeError as exc:
         console.print(f"[bold red]Error:[/] {exc}")
         raise typer.Exit(1) from exc
 
-    # Tag timing provenance so the report labels E2E% as TraceLens-sourced.
     if trace_context_from:
         from dataclasses import replace as _replace
         result = _replace(result, trace_context_source="tracelens")
@@ -467,8 +506,8 @@ def profile(
     md_path.write_text(format_profiling_markdown(result, analysis_results, output_dir=output_dir))
 
     console.print(f"\n[bold]Outputs saved to {output_dir}/:[/bold]")
-    console.print(f"  report.json   - structured JSON report")
-    console.print(f"  REPORT.md     - human-readable markdown")
+    console.print("  report.json   - structured JSON report")
+    console.print("  REPORT.md     - human-readable markdown")
 
 
 @app.command(name="full-analysis", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -476,15 +515,31 @@ def full_analysis(
     ctx: typer.Context,
     top_k: int = typer.Option(10, "--top-k", help="Top kernels to profile."),
     counter_set: str = typer.Option("auto", "--counter-set", help="Counter preset: auto or custom."),
+    counters: Optional[str] = typer.Option(None, "--counters", help="Explicit counter names, comma-separated. Selects the custom counter set; requires single-pass SDK compatibility."),
+    dtypes: Optional[str] = typer.Option(None, "--dtypes", help="Comma-separated counter-coverage hints, e.g. BF16,FP8,FP4. Does not assign a dtype to unresolved kernels."),
     output_dir: str = typer.Option("./profilelens_run", "--output-dir", help="Output directory."),
     output: OutputFormat = typer.Option(OutputFormat.rich, "--output", "-o", help="Output format."),
     run_roofline: bool = typer.Option(True, "--run-roofline/--no-roofline", help="Run roofline microbenchmark."),
     refresh_roofline: bool = typer.Option(False, "--refresh-roofline", help="Force re-run of roofline benchmark."),
     sample_dispatches: int = typer.Option(10, "--sample-dispatches", help="Dispatches to sample per kernel (0 = profile all)."),
+    workload_timeout: float = typer.Option(
+        0.0, "--workload-timeout",
+        help="Total seconds to allow the workload to run; 0 (the default) means "
+             "no limit -- profiler should not cap how long your workload legitimately takes to complete.",
+    ),
+    workload_idle_timeout: float = typer.Option(
+        1800.0, "--workload-idle-timeout",
+        help="Stop the workload if it makes no progress, no CPU time and no new "
+             "output for this many seconds; 0 disables. Catches deadlocks "
+             "without stopping long-running work.",
+    ),
 ) -> None:
     """One-shot: trace collection + analysis + kernel profiling + consolidated report. The workload must have kineto/torch.profiler tracing enabled internally."""
+    counter_set, custom_ctr, counter_dtype_hints = _counter_options(counter_set, counters, dtypes)
     import subprocess
     import time as _time
+
+    output_dir = os.path.abspath(output_dir)
 
     from profilelens.profile.runner import (
         collect_recorded_traces,
@@ -493,7 +548,7 @@ def full_analysis(
         merge_rank_analyses,
         run_profile as _run,
     )
-    from profilelens.profile.dtype_detect import dtype_from_query_result
+    from profilelens.profile.dtype_detect import UNKNOWN_DTYPE, dtype_from_query_result
     from profilelens.profile.report import (
         format_profiling_json,
         format_profiling_markdown,
@@ -509,7 +564,7 @@ def full_analysis(
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Roofline run first on a fully idle GPU before the workload.
+    # Measure roofline peaks first, on an idle GPU.
     if run_roofline:
         from profilelens.profile.gpu_detect import detect_gpu
         from profilelens.profile.roofline_bench import run_roofline_benchmark
@@ -523,8 +578,6 @@ def full_analysis(
             console.print(
                 "[bold]Roofline pre-pass:[/bold] measuring/using cached peaks before Phase 1"
             )
-            # run_roofline_benchmark caches per GPU model (schema/ref-marked) and
-            # only re-measures on force or an invalid/poisoned cache.
             run_roofline_benchmark(
                 cache_dir,
                 gpu_for_roofline.model,
@@ -532,22 +585,13 @@ def full_analysis(
                 force=refresh_roofline,
             )
         except (RuntimeError, FileNotFoundError) as exc:
-            # Don't fail the run — runner.py will retry after Phase 1 as a fallback.
             console.print(
                 f"[yellow]Roofline pre-pass skipped: {exc} (will retry after Phase 1)[/yellow]"
             )
 
-    # Run 1: Execute workload for trace collection.
-    # We launch the workload bare (no rocprofv3 wrap) but inject the
-    # profilelens worker shim so its torch.profiler patches install in
-    # every Python process — including TP workers. The patches are a
-    # no-op for capture (no rocprofv3 listener), but write per-PID audit
-    # JSONs that prove the user's torch.profiler block actually fired.
-    # Phase 2 then can't be silently broken by a missing trigger window.
     console.print("[bold]Phase 1:[/bold] Running workload for trace collection...")
     phase1_audit_dir = Path(output_dir) / ".profilelens_audit_phase1"
     phase1_audit_dir.mkdir(exist_ok=True)
-    # Wipe stale entries from a prior run in the same output_dir.
     for old in phase1_audit_dir.glob("*.json"):
         old.unlink()
 
@@ -572,16 +616,23 @@ def full_analysis(
         console.print(f"[bold red]Error:[/] command not found: {exc}")
         raise typer.Exit(1) from exc
     try:
-        returncode = proc.wait()
+        returncode = _wait_with_watchdog(
+            proc,
+            wall_timeout=workload_timeout,
+            idle_timeout=workload_idle_timeout,
+        )
+    except _WorkloadTimeout as exc:
+        console.print(
+            f"[bold red]Error:[/] Phase 1 workload {exc.reason}; stopping it."
+        )
+        _reap_process_group(proc.pid, console=console, label="Phase 1 (timeout)")
+        raise typer.Exit(1) from None
     finally:
         _reap_process_group(proc.pid, console=console, label="Phase 1")
     phase1_workload_s = _time.time() - t_before
     console.print(f"  Workload exited with code {returncode}")
     console.print(f"  Workload duration (with tracing): {phase1_workload_s:.1f}s")
 
-    # Audit: did the user's workload actually call torch.profiler? If
-    # not, Phase 2's --selected-regions capture would silently produce
-    # no PMC data, so fail fast here with an actionable message.
     audit_total = _aggregate_phase_audit(phase1_audit_dir)
     triggers = (
         audit_total.get("torch_profiler_start", 0)
@@ -610,7 +661,6 @@ def full_analysis(
         console.print("  (tensorboard_trace_handler routes through it too). Ensure your workload calls")
         console.print("  prof.export_chrome_trace(...) or sets on_trace_ready=tensorboard_trace_handler(...).")
         raise typer.Exit(1)
-    # Read each trace's own identity (distributedInfo.rank + worker PID).
     from profilelens.profile.runner import enrich_rank_identities
     enrich_rank_identities(rank_traces)
     rank_traces.sort(key=lambda t: (t.rank if t.rank is not None else 1 << 30, t.path.name))
@@ -624,7 +674,6 @@ def full_analysis(
         )
     else:
         console.print(f"  Found trace: {primary.path}")
-
 
     shim_pids = {p.stem for p in phase1_dtype_dir.glob("*.json")}
     rank_manifest = [
@@ -662,7 +711,7 @@ def full_analysis(
                 rlens = _validate_trace(str(rt.path))
                 extra.append((rt.rank if rt.rank is not None else -1, _run_merge_queries(rlens)))
                 console.print(f"    [dim]rank {rt.rank}: merged[/dim]")
-            except Exception as exc:  # never drop the whole run for one rank
+            except Exception as exc:
                 console.print(f"    [yellow]rank {rt.rank}: skipped ({exc})[/yellow]")
         analysis_results, rank_breakdown = merge_rank_analyses(analysis_results, extra)
         if rank_breakdown.get("ep_asymmetric"):
@@ -685,7 +734,6 @@ def full_analysis(
         ranks_json.write_text(json.dumps(rank_breakdown, indent=2))
         console.print(f"  Per-rank Phase-1 breakdown + manifest -> {ranks_json.name}")
 
-    # Extract top-K kernels and dtype
     kernel_names = extract_top_k_from_results(analysis_results, top_k)
     if not kernel_names:
         console.print("[bold red]Error:[/] no GPU kernels found in trace")
@@ -698,9 +746,8 @@ def full_analysis(
             dtype = dtype_from_query_result(r.rows)
             break
     if dtype is None:
-        dtype = "BF16"
+        dtype = UNKNOWN_DTYPE
 
-    # Per-kernel multi-dtype resolution
     from profilelens.profile.dtype_detect import (
         merge_dtype_sidecar,
         resolve_kernel_dtypes,
@@ -712,24 +759,24 @@ def full_analysis(
     per_kernel_dtype, observed_dtypes = resolve_kernel_dtypes(
         kernel_names, sidecar, trace_dtypes, global_dtype=dtype,
     )
-    if observed_dtypes:
-        dtype = observed_dtypes[0]  # dominant for single-dtype fallbacks
+    if UNKNOWN_DTYPE in observed_dtypes:
+        dtype = UNKNOWN_DTYPE
+    elif observed_dtypes:
+        dtype = observed_dtypes[0]
     n_triton = sum(1 for _, s in per_kernel_dtype.values() if s == "triton_hook")
     n_trace = sum(1 for _, s in per_kernel_dtype.values() if s == "trace_corr")
     n_name = sum(1 for _, s in per_kernel_dtype.values() if s == "name_fallback")
     console.print(
-        f"  Observed dtypes: {', '.join(observed_dtypes) or 'BF16'} "
+        f"  Kernel dtype resolution: {', '.join(observed_dtypes) or UNKNOWN_DTYPE} "
         f"[dim](top-K sources: {n_triton} triton, {n_trace} trace, "
         f"{n_name} name-fallback)[/dim]"
     )
 
-    # Save Phase 1 JSON for merging
     analysis_json = Path(output_dir) / "analysis.json"
     analysis_json.parent.mkdir(parents=True, exist_ok=True)
     from profilelens.trace.formatter import format_json
     analysis_json.write_text(format_json(analysis_results))
 
-    # Phase 2: Profile kernels
     console.print(f"\n[bold]Phase 2:[/bold] Profiling {len(kernel_names)} kernels...")
 
     cfg = load_config()
@@ -752,6 +799,8 @@ def full_analysis(
             user_command=user_command,
             dtype=dtype,
             counter_set_mode=counter_set,
+            custom_counters=custom_ctr,
+            counter_dtype_hints=counter_dtype_hints,
             run_roofline=run_roofline,
             refresh_roofline=refresh_roofline,
             output_dir=output_dir,
@@ -762,21 +811,16 @@ def full_analysis(
             profiling_config=profiling_cfg,
             per_kernel_dtype=per_kernel_dtype,
             observed_dtypes=observed_dtypes,
+            workload_timeout=workload_timeout,
+            workload_idle_timeout=workload_idle_timeout,
         )
     except RuntimeError as exc:
         console.print(f"[bold red]Error:[/] {exc}")
         raise typer.Exit(1) from exc
 
-    # Stamp the Phase 1 wall-clock onto the result so the report can show
-    # both halves of the timing breakdown.
     from dataclasses import replace as _replace
     prof_result = _replace(prof_result, phase1_workload_s=round(phase1_workload_s, 1))
 
-    # Phase 2 audit: confirm the shim's roctx pass-through actually fired
-    # inside the rocprofv3-wrapped workload. If torch.profiler started
-    # but roctx didn't, the rocprofiler-sdk Python bindings weren't on
-    # sys.path — surface that explicitly so it's not mistaken for an
-    # empty workload.
     phase2_audit_dir = Path(output_dir) / "profile" / ".profilelens_audit"
     p2_audit = _aggregate_phase_audit(phase2_audit_dir)
     p2_starts = (
@@ -799,8 +843,7 @@ def full_analysis(
             f"{p2_audit.get('processes', 0)} process(es)[/dim]"
         )
 
-    # Output consolidated report
-    console.print(f"\n[bold]Consolidated Report[/bold]")
+    console.print("\n[bold]Consolidated Report[/bold]")
     if output is OutputFormat.json:
         console.print(format_profiling_json(prof_result, analysis_results))
     elif output is OutputFormat.markdown:
@@ -811,11 +854,9 @@ def full_analysis(
     else:
         print_profiling_rich(prof_result, console, analysis_results)
 
-    # Save all outputs
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # create per-scenario independent folders (roctx pl_region_<N> ranges)
     regions = prof_result.per_region_kernels
     if n_ranks <= 1 and len(regions) > 1:
         from dataclasses import replace as _replace
@@ -849,10 +890,9 @@ def full_analysis(
             flydsl_args=sidecar.get("flydsl_args"),
             capture_graphs=sidecar.get("capture_graphs")))
 
-    # Timing summary
     phase2_workload_s = prof_result.profiling_duration_s
     overhead = (phase2_workload_s / phase1_workload_s - 1) * 100 if phase1_workload_s > 0 else 0
-    console.print(f"\n[bold]Timing:[/bold]")
+    console.print("\n[bold]Timing:[/bold]")
     console.print(f"  Phase 1 workload (tracing):   {phase1_workload_s:.1f}s")
     console.print(f"  Phase 2 workload (profiling):  {phase2_workload_s:.1f}s")
     if overhead >= 0:
@@ -861,9 +901,9 @@ def full_analysis(
         console.print(f"  Profiling overhead:            {overhead:.0f}%")
 
     console.print(f"\n[bold]Outputs saved to {output_dir}/:[/bold]")
-    console.print(f"  report.json   - structured JSON report")
-    console.print(f"  REPORT.md     - human-readable markdown")
-    console.print(f"  analysis.json - Phase 1 trace analysis")
+    console.print("  report.json   - structured JSON report")
+    console.print("  REPORT.md     - human-readable markdown")
+    console.print("  analysis.json - Phase 1 trace analysis")
 
 
 @app.command()
@@ -956,6 +996,7 @@ def setup_roofline(
     measure: bool = typer.Option(False, "--measure", help="Also run the microbenchmark now to populate the per-GPU peak cache."),
     device: int = typer.Option(0, "--device", help="GPU index to benchmark when --measure is set."),
 ) -> None:
+    """Fetch the pinned roofline benchmark and optionally measure peaks."""
     from profilelens.profile.roofline_bench import (
         ROOFLINE_REF, bench_dir, ensure_roofline_bench, is_fetched,
     )

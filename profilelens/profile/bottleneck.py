@@ -25,12 +25,12 @@ def compute_headroom(
     e2e_pct: float,
 ) -> HeadroomInfo:
     """Compute optimization headroom and priority score."""
-    if mfma_util < 0 and bw_util < 0:
+    if bottleneck == "UNKNOWN" or (mfma_util < 0 and bw_util < 0):
         return HeadroomInfo(
             pct_of_peak=-1.0,
             headroom=-1.0,
             e2e_pct=round(e2e_pct, 1),
-            priority_score=round(e2e_pct / 100.0 if e2e_pct > 0 else 0.0, 4),
+            priority_score=-1.0,
         )
 
     if bottleneck == "COMPUTE":
@@ -55,6 +55,8 @@ def compute_headroom(
 
 def classify_bottleneck(mfma_util: float, bw_util: float) -> str:
     """Classify kernel bottleneck from utilization percentages."""
+    if mfma_util < 0 or bw_util < 0:
+        return "UNKNOWN"
     if bw_util > 1.5 * mfma_util and bw_util > 30:
         return "MEMORY"
     if mfma_util > 1.5 * bw_util and mfma_util > 30:

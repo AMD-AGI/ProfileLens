@@ -1,18 +1,9 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Operation categorization compatible with TraceLens.
-
-Ports the category mapping from TraceLens's ``torch_op_mapping.py`` and
-``category_utils.py`` so ProfileLens analysis uses the same groupings
-as TraceLens report generation.  No TraceLens dependency required.
-"""
+"""TraceLens-compatible operation categories (no TraceLens dependency)."""
 
 from __future__ import annotations
-
-# ---------------------------------------------------------------------------
-# Layer 1: op name -> raw category (mirrors TraceLens categorize_torch_op)
-# ---------------------------------------------------------------------------
 
 GEMM_OPS: frozenset[str] = frozenset({
     "aten::mm", "aten::addmm", "aten::_scaled_mm", "aten::bmm",
@@ -112,11 +103,7 @@ SOFTMAX_OPS: frozenset[str] = frozenset({
 
 
 def categorize_op(name: str) -> str:
-    """Assign a raw category string to a CPU op name.
-
-    Mirrors TraceLens ``categorize_torch_op`` with additional explicit
-    mappings for ops TraceLens classifies via kernel-name heuristics.
-    """
+    """Map a CPU op name to a raw TraceLens category."""
     if name in GEMM_OPS:
         return "GEMM"
     if name in CONV_FWD_OPS:
@@ -146,10 +133,6 @@ def categorize_op(name: str) -> str:
     return "other"
 
 
-# ---------------------------------------------------------------------------
-# Layer 2: raw category -> display name (mirrors TraceLens get_enhanced_category)
-# ---------------------------------------------------------------------------
-
 _ENHANCED_NORM_SUBSTRINGS = (
     "batch_norm", "batchnorm", "layer_norm", "layernorm",
     "group_norm", "groupnorm", "instance_norm", "rms_norm",
@@ -159,10 +142,7 @@ _ENHANCED_MOE_SUBSTRINGS = ("moe", "fused_moe")
 
 
 def display_category(op_name: str, raw_category: str) -> tuple[str, str]:
-    """Return ``(slug, display_name)`` applying enhanced overrides.
-
-    Mirrors TraceLens ``get_enhanced_category``.
-    """
+    """Return ``(slug, display_name)`` as TraceLens ``get_enhanced_category`` does."""
     lower = op_name.lower()
     if any(s in lower for s in _ENHANCED_MOE_SUBSTRINGS):
         return "moe_fused", "MoE Fused"

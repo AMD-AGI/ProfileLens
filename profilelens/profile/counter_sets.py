@@ -10,8 +10,14 @@ from dataclasses import dataclass
 
 from profilelens.profile.dtype_detect import mfma_counters_for_dtypes
 
-
 CompatibilityCheck = Callable[[tuple[str, ...]], tuple[bool, str]]
+
+# DRAM request counts in 32-byte units; used only when all are available.
+DRAM_REQUEST_BYTE_COUNTERS = (
+    "TCC_EA0_RDREQ_DRAM_32B_sum",
+    "TCC_EA0_WRREQ_WRITE_DRAM_32B_sum",
+    "TCC_EA0_WRREQ_ATOMIC_DRAM_32B_sum",
+)
 
 
 @dataclass(frozen=True)
@@ -34,13 +40,10 @@ class CounterGroup:
     quality: str = "exact"
 
 
-# These groups describe metric intent, not product configuration. Whether each
-# counter exists and whether groups fit together is decided by rocprofv3-avail
-# on the actual GPU.
 _BASE_GROUPS = (
     CounterGroup(
         "hbm_traffic",
-        ("BANDWIDTH_EA",),
+        ("FETCH_SIZE", "WRITE_SIZE"),
         priority=100,
         required=True,
     ),
@@ -51,26 +54,41 @@ _BASE_GROUPS = (
         required=True,
     ),
     CounterGroup(
-        "valu_flops",
+        "valu_lane_instructions",
         ("SQ_INSTS_VALU",),
-        priority=90,
-        required=True,
+        priority=20,
     ),
     CounterGroup(
-        "valu_utilization",
-        ("SQ_ACTIVE_INST_VALU",),
+        "valu_busy",
+        ("VALUBusy",),
         priority=80,
     ),
     CounterGroup(
         "occupancy",
+        ("OccupancyPercent",),
+        priority=85,
+    ),
+    CounterGroup(
+        "wave_cycles",
         ("SQ_WAVE_CYCLES",),
-        priority=80,
+        priority=75,
+    ),
+    CounterGroup(
+        "valu_lane_utilization",
+        ("VALUUtilization",),
+        priority=60,
     ),
 )
 
 
-
 _DIAGNOSTIC_GROUPS = (
+    CounterGroup(
+        "l1_hit_rate_direct",
+        ("TCP_TOTAL_CACHE_ACCESSES_sum", "TCP_CACHE_MISS"),
+        priority=70,
+        signal="l1_hit_rate",
+        quality="direct",
+    ),
     CounterGroup(
         "l1_hit_rate_exact",
         (
@@ -146,9 +164,7 @@ def _candidate_groups(
     elif dtype:
         requested_dtypes = (dtype,)
     else:
-        # Preserve the former unknown-dtype coverage. Without these signals a
-        # direct ``profile --kernel-names`` run could report zero MFMA work
-        # simply because no trace was supplied to identify the precise dtype.
+        # Default MFMA coverage when no dtype is known.
         requested_dtypes = ("BF16", "FP16", "FP8")
 
     mfma_groups = tuple(
@@ -242,6 +258,11 @@ def select_counter_set(
 ) -> CounterSet:
     """Build the highest-value one-pass set supported by the runtime GPU."""
     candidates = _candidate_groups(dtype, observed_dtypes)
+    if set(DRAM_REQUEST_BYTE_COUNTERS).issubset(available_counters):
+        candidates = tuple(
+            CounterGroup("hbm_traffic", DRAM_REQUEST_BYTE_COUNTERS, 100, required=True)
+            if group.name == "hbm_traffic" else group for group in candidates
+        )
     selected = _select_compatible_groups(
         candidates,
         available_counters,

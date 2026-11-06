@@ -1,7 +1,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Profilelens worker shim."""
+"""ProfileLens worker shim."""
 
 from __future__ import annotations
 
@@ -14,14 +14,17 @@ import os
 import sys
 import threading
 
-
-# ---------------------------------------------------------------------------
-# Part 1: cxa_finalize hack to force rocprofv3's tool_fini handlers to run on worker exit.
-# ---------------------------------------------------------------------------
+_FINALIZED_PID: int | None = None
 
 
 def _profilelens_force_rocprof_finalize() -> None:
-    """Run all C ``atexit`` handlers — including rocprofv3's tool_fini."""
+    """Flush native exit handlers once, preserving Python's real exit status."""
+    global _FINALIZED_PID
+    if _FINALIZED_PID == os.getpid():
+        return
+    _FINALIZED_PID = os.getpid()
+    _write_audit_now()
+    _write_dtype_sidecar()
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=False)
         libc.__cxa_finalize.argtypes = [ctypes.c_void_p]
@@ -34,21 +37,37 @@ def _profilelens_force_rocprof_finalize() -> None:
         sys.stderr.flush()
     except Exception:
         pass
-    os._exit(0)
+
+
+class _ForkFinalizerToken:
+    pass
+
+
+_FORK_FINALIZER_TOKEN = _ForkFinalizerToken()
+
+
+def _after_fork_finalize_hook(_token) -> None:
+    """Reinstall after multiprocessing clears inherited atexit callbacks."""
+    from multiprocessing import util
+
+    atexit.register(_profilelens_force_rocprof_finalize)
+    # Older fork launchers call os._exit without atexit; the PID guard dedupes.
+    util.Finalize(None, _profilelens_force_rocprof_finalize, exitpriority=-100)
 
 
 def _install_finalize_hook() -> None:
-    if os.environ.get("PROFILELENS_ROCPROF_FINALIZE") != "1":
+    mode = os.environ.get("PROFILELENS_ROCPROF_FINALIZE")
+    if mode not in {"1", "fork"}:
         return
     if getattr(sys, "_profilelens_finalize_installed", False):
         return
     sys._profilelens_finalize_installed = True  # type: ignore[attr-defined]
-    atexit.register(_profilelens_force_rocprof_finalize)
+    # Fork workers bypass libc exit handlers; the main process runs them itself.
+    if mode == "1":
+        atexit.register(_profilelens_force_rocprof_finalize)
+    from multiprocessing import util
 
-
-# ---------------------------------------------------------------------------
-# Part 2: torch.profiler interception + roctx pass-through
-# ---------------------------------------------------------------------------
+    util.register_after_fork(_FORK_FINALIZER_TOKEN, _after_fork_finalize_hook)
 
 
 _AUDIT: dict[str, int] = {
@@ -62,8 +81,8 @@ _AUDIT: dict[str, int] = {
 
 
 _TRACE_PATHS: list[str] = []
+_TRACE_EXPORTS: list[dict] = []
 
-# Phase-2 graph-plan diagnostics.
 _GRAPH_PLAN_STATS = {"hit": 0, "miss": 0, "mismatch": 0}
 
 
@@ -78,6 +97,7 @@ def _write_audit_now() -> None:
             "pid": os.getpid(),
             "ppid": os.getppid(),
             "trace_paths": list(_TRACE_PATHS),
+            "trace_exports": list(_TRACE_EXPORTS),
             "region_paths": dict(_REGION_PATHS),
             "graph_plan_stats": dict(_GRAPH_PLAN_STATS),
             **_AUDIT,
@@ -93,6 +113,10 @@ def _write_audit_now() -> None:
 def _is_phase2() -> bool:
     """True when running inside the rocprofv3-wrapped Phase 2 workload."""
     return os.environ.get("PROFILELENS_PHASE2") == "1"
+
+
+def _uses_native_regions() -> bool:
+    return os.environ.get("PROFILELENS_NATIVE_SELECTED_REGIONS") == "1"
 
 
 _ROCTX_LIB: ctypes.CDLL | None = None
@@ -155,7 +179,6 @@ def _emit_roctx(op: str) -> None:
     _write_audit_now()
 
 
-# Per-scenario named roctx ranges
 _ROCTX_SESSION = [-1]
 _REGION_PATHS: dict[str, str] = {}
 _PROFILER_RANGE_TLS = threading.local()
@@ -201,6 +224,8 @@ def _profiler_region_pop(opened: bool) -> None:
         _PROFILER_RANGE_TLS.depth = depth - 1
     if opened:
         _roctx_range_pop()
+    if opened and depth == 1 and _uses_native_regions():
+        _emit_roctx("pause")
 
 
 def _iter_tensor_values(values, seen_containers=None):  # type: ignore[no-untyped-def]
@@ -239,7 +264,7 @@ def _shape_signature_from_values(values) -> str:
             shp = list(v.shape)
         except Exception:
             continue
-        # Distinguish scalars from one-dimensional zero-length tensors.
+        # Distinguish scalars from zero-length 1-D tensors.
         parts.append("x".join(str(int(d)) for d in shp) if shp else "scalar")
     return "-".join(parts)
 
@@ -318,10 +343,11 @@ def _patch_torch_profiler_profile() -> bool:
     orig_key_averages = getattr(cls, "key_averages", None)
 
     def _start(self, *a, **kw):  # type: ignore[no-untyped-def]
-        # Phase 2: the schedule state machine
         orig_start(self, *a, **kw)
         _AUDIT["torch_profiler_start"] += 1
         _write_audit_now()
+        if getattr(self, "_profilelens_native_trace_hooks", False):
+            return
         if not getattr(self, "_profilelens_emitted_via_step", False):
             _emit_roctx("resume")
         _ROCTX_SESSION[0] += 1
@@ -337,6 +363,8 @@ def _patch_torch_profiler_profile() -> bool:
     def _stop(self, *a, **kw):  # type: ignore[no-untyped-def]
         _AUDIT["torch_profiler_stop"] += 1
         _write_audit_now()
+        if getattr(self, "_profilelens_native_trace_hooks", False):
+            return orig_stop(self, *a, **kw)
         phase2 = _is_phase2()
         if not getattr(self, "_profilelens_emitted_via_step", False):
             if not phase2:
@@ -344,7 +372,6 @@ def _patch_torch_profiler_profile() -> bool:
         if not phase2:
             return orig_stop(self, *a, **kw)
 
-        # Keep queued GPU work inside the selected region.
         sync_error = None
         try:
             _synchronize_profiler_device(self)
@@ -355,6 +382,9 @@ def _patch_torch_profiler_profile() -> bool:
             _profiler_region_pop(region_open)
             self._profilelens_region_open = False  # type: ignore[attr-defined]
             self._profilelens_region_active = False  # type: ignore[attr-defined]
+        if (region_open and not _uses_native_regions()
+                and not getattr(self, "_profilelens_emitted_via_step", False)):
+            _emit_roctx("pause")
 
         try:
             result = orig_stop(self, *a, **kw)
@@ -367,8 +397,9 @@ def _patch_torch_profiler_profile() -> bool:
         return result
 
     def _export_chrome_trace(self, path, *a, **kw):  # type: ignore[no-untyped-def]
-        if _is_phase2():
+        if _is_phase2() and os.environ.get("PROFILELENS_EXPORT_PHASE2_TRACE") != "1":
             return None
+        result = orig_export_chrome_trace(self, path, *a, **kw)
         try:
             ap = os.path.abspath(path)
             _TRACE_PATHS.append(ap)
@@ -378,10 +409,21 @@ def _patch_torch_profiler_profile() -> bool:
                 f"pl_region_{_ROCTX_SESSION[0]}",
             )
             _REGION_PATHS[region_name] = ap
+            digest = hashlib.sha256()
+            with open(ap, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            _TRACE_EXPORTS.append({
+                "process_id": str(os.getpid()),
+                "region_name": region_name,
+                "trace_path": ap,
+                "sha256": digest.hexdigest(),
+                "phase2": _is_phase2(),
+            })
             _write_audit_now()
         except Exception:
             pass
-        return orig_export_chrome_trace(self, path, *a, **kw)
+        return result
 
     def _export_stacks(self, *a, **kw):  # type: ignore[no-untyped-def]
         if _is_phase2():
@@ -409,25 +451,24 @@ def _patch_torch_profiler_profile() -> bool:
 
 
 def _patch_kineto_profile() -> bool:
-    """Patch ``_KinetoProfile``"""
+    """Patch ``_KinetoProfile`` init, trace hooks and schedule step."""
     try:
-        from torch.profiler.profiler import _KinetoProfile  # type: ignore[import-not-found]
         from torch.profiler import ProfilerAction  # type: ignore[import-not-found]
         from torch.profiler import profile as _PublicProfile  # type: ignore[import-not-found]
+        from torch.profiler.profiler import _KinetoProfile  # type: ignore[import-not-found]
     except Exception:
-        # Private API moved or torch not installed yet — the public-API
-        # patches on torch.profiler.profile still cover manual callers.
         return False
 
     if getattr(_KinetoProfile, "_profilelens_kineto_patched", False):
         return True
 
-    # __init__ is on _KinetoProfile (parent). Modern torch (>=2.1) defines
-    # step on the public subclass torch.profiler.profile, not on
-    # _KinetoProfile — so we patch step there.
     orig_init = _KinetoProfile.__init__
+    # torch >= 2.1 defines step on the public subclass.
     step_owner = _PublicProfile if "step" in _PublicProfile.__dict__ else _KinetoProfile
     orig_step = step_owner.step
+    orig_start_trace = getattr(_KinetoProfile, "start_trace", None)
+    orig_stop_trace = getattr(_KinetoProfile, "stop_trace", None)
+    can_hook_trace = callable(orig_start_trace) and callable(orig_stop_trace)
 
     def _patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         if kwargs.get("record_shapes") is False:
@@ -438,12 +479,53 @@ def _patch_kineto_profile() -> bool:
         kwargs["record_shapes"] = True
 
         self._profilelens_emitted_via_step = False
+        self._profilelens_native_trace_hooks = (
+            can_hook_trace and _is_phase2() and _uses_native_regions()
+        )
         orig_init(self, *args, **kwargs)
+
+    def _start_trace(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = orig_start_trace(self, *args, **kwargs)
+        if not getattr(self, "_profilelens_native_trace_hooks", False):
+            return result
+        if not getattr(self, "_profilelens_region_active", False):
+            _ROCTX_SESSION[0] += 1
+            self._profilelens_region_name = f"pl_region_{_ROCTX_SESSION[0]}"
+            if not getattr(_PROFILER_RANGE_TLS, "depth", 0):
+                _emit_roctx("resume")
+            self._profilelens_region_open = _profiler_region_push(
+                self._profilelens_region_name
+            )
+            self._profilelens_region_active = True
+        return result
+
+    def _stop_trace(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        sync_error = None
+        if (getattr(self, "_profilelens_native_trace_hooks", False)
+                and getattr(self, "_profilelens_region_active", False)):
+            try:
+                _synchronize_profiler_device(self)
+            except BaseException as exc:
+                sync_error = exc
+            _profiler_region_pop(bool(getattr(self, "_profilelens_region_open", False)))
+            self._profilelens_region_open = False
+            self._profilelens_region_active = False
+        try:
+            result = orig_stop_trace(self, *args, **kwargs)
+        except BaseException as stop_error:
+            if sync_error is not None:
+                raise stop_error from sync_error
+            raise
+        if sync_error is not None:
+            raise sync_error
+        return result
 
     RECORD_ACTIONS = (ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE)
 
     def _patched_step(self):  # type: ignore[no-untyped-def]
         """Drive roctx push/pop on schedule action transitions."""
+        if getattr(self, "_profilelens_native_trace_hooks", False):
+            return orig_step(self)
         prev_action = getattr(self, "current_action", None)
         orig_step(self)
         new_action = getattr(self, "current_action", None)
@@ -451,20 +533,17 @@ def _patch_kineto_profile() -> bool:
         was_recording = prev_action in RECORD_ACTIONS
         is_recording = new_action in RECORD_ACTIONS
         if is_recording and not was_recording:
-            # Schedule just entered RECORD / RECORD_AND_SAVE — open the
-            # rocprofv3 --selected-regions capture window.
             _emit_roctx("resume")
             self._profilelens_emitted_via_step = True
         elif was_recording and not is_recording:
-            # Schedule just left a RECORD state. In Phase 1 we pair the
-            # resume with a pause so each scheduled window is a discrete
-            # PMC sample set. In Phase 2 we skip pause: rocprofv3's
-            # --selected-regions treats pause as "close window"
-            # which would drop every kernel after the first cycle.
+            # Phase 2 skips pause: it would close the --selected-regions window.
             if not _is_phase2():
                 _emit_roctx("pause")
 
     _KinetoProfile.__init__ = _patched_init
+    if can_hook_trace:
+        _KinetoProfile.start_trace = _start_trace
+        _KinetoProfile.stop_trace = _stop_trace
     step_owner.step = _patched_step
     _KinetoProfile._profilelens_kineto_patched = True  # type: ignore[attr-defined]
     return True
@@ -484,7 +563,6 @@ def _patch_torch_cuda_profiler() -> bool:
 
     orig_start = tcp.start
     orig_stop = tcp.stop
-    # Balance nested legacy start/stop calls.
     region_stack: list[bool] = []
 
     def _start(*a, **kw):  # type: ignore[no-untyped-def]
@@ -510,7 +588,6 @@ def _patch_torch_cuda_profiler() -> bool:
             _emit_roctx("pause")
             return orig_stop(*a, **kw)
 
-        # This API maps to torch.cuda on both CUDA and ROCm builds.
         started = bool(region_stack)
         region_open = region_stack.pop() if started else False
         sync_error = None
@@ -521,8 +598,9 @@ def _patch_torch_cuda_profiler() -> bool:
                 sync_error = exc
         if region_open:
             _profiler_region_pop(True)
+            if not _uses_native_regions():
+                _emit_roctx("pause")
         elif started:
-            # Consume the nested logical depth without popping ROCTX.
             _profiler_region_pop(False)
         if sync_error is not None:
             raise sync_error
@@ -541,12 +619,6 @@ def _patch_torch_profiler_both() -> bool:
     return a and b
 
 
-# ---------------------------------------------------------------------------
-# Part 3: dtype observation hooks (graph-capture dispatch + Triton launch).
-# ---------------------------------------------------------------------------
-
-
-# torch dtype -> internal label map
 _TORCH_DTYPE_MAP: dict[str, str] = {
     "torch.bfloat16": "BF16",
     "torch.float16": "FP16", "torch.half": "FP16",
@@ -624,8 +696,6 @@ def _record_tensor_dtypes(values, bucket: dict) -> bool:
     return found
 
 
-# CUDA/HIP graph capture inventory and replay markers.
-
 _CAPTURE_TLS = threading.local()
 _GRAPH_SEQ = [0]
 
@@ -639,8 +709,8 @@ class _HipDim3(ctypes.Structure):
 
 
 class _HipKernelNodeParams(ctypes.Structure):
-    # HIP and CUDA use different field ordering.
     _fields_ = [
+        # HIP field order differs from CUDA.
         ("blockDim", _HipDim3),
         ("extra", ctypes.POINTER(ctypes.c_void_p)),
         ("func", ctypes.c_void_p),
@@ -667,9 +737,19 @@ def _clear_graph_node_name_cache(gid: "str | None") -> None:
 
 
 def _canonical_kernel_symbol(name: str) -> str:
-    """Normalize the small presentation difference seen in rocprof CSVs."""
+    """Normalize names between kineto and rocprof CSVs."""
     name = (name or "").strip()
-    return name[5:] if name.startswith("void ") else name
+    if name.startswith("void "):
+        name = name[5:]
+    name = name.rstrip()
+    if not name:
+        return ""
+    for suffix in (" [clone .kd]", "[clone .kd]"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)].rstrip()
+    if name.endswith(".kd"):
+        return name[:-3].rstrip()
+    return name
 
 
 def _demangle_kernel_symbol(name: str) -> str:
@@ -829,7 +909,7 @@ def _captured_kernel_nodes() -> "list[dict] | None":
             kind = ctypes.c_int(-1)
             if runtime["node_type"](
                 ctypes.c_void_p(raw_node), ctypes.byref(kind)
-            ) != 0 or kind.value != 0:  # HIP/CUDA enum 0 == kernel node
+            ) != 0 or kind.value != 0:  # 0 == kernel node
                 continue
             handle = int(raw_node)
             cache_key = (int(capture_id.value), handle)
@@ -841,8 +921,6 @@ def _captured_kernel_nodes() -> "list[dict] | None":
                 if runtime["node_params"](
                     ctypes.c_void_p(raw_node), ctypes.byref(params)
                 ) == 0 and params.func:
-                    # Native kernels expose host pointers; module kernels expose
-                    # hipFunction_t handles.
                     raw_name = runtime["name_ref_by_ptr"](
                         params.func, ctypes.c_void_p(stream)
                     )
@@ -852,7 +930,6 @@ def _captured_kernel_nodes() -> "list[dict] | None":
                         name = _demangle_kernel_symbol(
                             raw_name.decode("utf-8", errors="replace")
                         )
-            # Cache misses too; later graph walks revisit the same nodes.
             if not cached:
                 _GRAPH_NODE_NAME_CACHE[cache_key] = name
             out.append({
@@ -865,9 +942,7 @@ def _captured_kernel_nodes() -> "list[dict] | None":
         return None
 
 
-# Phase-1 graph plans are matched by capture content and validated in Phase 2.
-
-_GRAPH_PLAN: "dict | None" = None  # _GRAPH_PLAN_STATS is declared near the top
+_GRAPH_PLAN: "dict | None" = None
 
 
 def _graph_plan_dir() -> "str | None":
@@ -919,7 +994,7 @@ def _load_graph_plan() -> dict:
             for graph in (payload.get("capture_graphs") or {}).values():
                 ops = graph.get("ops") or []
                 if not any("kernels" in (e or {}) for e in ops):
-                    continue  # Phase 1 could not resolve symbols; nothing to reuse
+                    continue
                 fp = _op_fingerprint(ops)
                 kernels = [list((e or {}).get("kernels") or ()) for e in ops]
                 ordered_keys = [
@@ -1002,7 +1077,6 @@ def _apply_graph_plan(gid: str) -> None:
     if not graph or not ops:
         return
 
-    # Discard partial ownership before validating the plan.
     with _DTYPE_LOCK:
         for op_entry in graph.get("ops") or ():
             if isinstance(op_entry, dict):
@@ -1051,7 +1125,6 @@ def _claim_captured_kernel_nodes() -> "list[dict] | None":
     if gid is None:
         return None
     if _graph_plan_available():
-        # Keep ownership absent until the plan is validated at capture_end.
         return None
     nodes = _captured_kernel_nodes()
     if nodes is None:
@@ -1110,10 +1183,7 @@ def _capture_record(
     shapes: list,
     kernels: "list[dict] | None" = None,
 ) -> None:
-    """Append an operation to the active capture.
-
-    ``kernels=None`` means unavailable; ``[]`` means no kernel was added.
-    """
+    """Append an op to the active capture (kernels: None = unknown, [] = none)."""
     gid = _active_capture_gid()
     if gid is None:
         return
@@ -1153,12 +1223,10 @@ def _select_replay_markers(ops: list) -> list:
                 elif stem:
                     markers.append(("stem", stem, sig))
         elif stem:
-            # Backward-compatible fallback for runtimes without graph queries.
             markers.append(("stem", stem, sig))
     return markers
 
 
-# Marker sequences are immutable after capture_end.
 _REPLAY_MARKER_CACHE: dict = {}
 
 
@@ -1192,7 +1260,6 @@ def _emit_graph_replay_markers(gid: str) -> None:
             pairs = ()
 
     if not phase2:
-        # Flush outside the non-reentrant dtype lock.
         _bump_dirty()
         return
     for kind, owner, sig in pairs:
@@ -1223,7 +1290,6 @@ def _record_triton(fn, args, kwargs, kernels: "list[dict] | None" = None) -> Non
     if kwargs:
         _record_tensor_dtypes(kwargs.values(), seen)
 
-    # An empty claim means an inner hook already recorded this launch.
     if kernels != []:
         _capture_record(
             f"triton::{name}", name, sig, seen, _tensor_shapes(vals), kernels
@@ -1295,7 +1361,6 @@ def _patch_triton_autotuner() -> bool:
             result = orig_arun(self, *args, **kwargs)
             if _triton_observation_count() == observations_before:
                 try:
-                    # Fallback for versions that bypass JITFunction.run.
                     _observe_triton_launch(getattr(self, "fn", self), args, kwargs)
                 except Exception:
                     pass
@@ -1307,7 +1372,7 @@ def _patch_triton_autotuner() -> bool:
 
 
 def _flydsl_stem(name: "str | None") -> "str | None":
-    """Normalize a MLIR DSL (FlyDSL launcher/kernel symbols)"""
+    """Normalize a FlyDSL launcher or kernel symbol to its stem."""
     if not name:
         return None
     i = len(name)
@@ -1352,7 +1417,7 @@ def _flydsl_named_args(fn, args, kwargs) -> list:
 
 def _flydsl_shape_signature(per_arg: list) -> str:
     """Canonical per-launch shape signature for same-kernel/multi-shape splitting."""
-    class _S:  # adapt (name, label, shape) tuples to the .shape protocol
+    class _S:
         __slots__ = ("shape",)
         def __init__(self, s): self.shape = s
     return _shape_signature_from_values(
@@ -1368,7 +1433,7 @@ def _record_flydsl(
         return
     seen: dict = {}
     shapes: list = []
-    per_arg: list = []  # (name, dtype_label, shape) for every tensor argument
+    per_arg: list = []
     for name, v in _flydsl_named_args(fn, args, kwargs):
         raw = str(getattr(v, "dtype", ""))
         dt = _TORCH_DTYPE_MAP.get(raw)
@@ -1399,7 +1464,6 @@ def _record_flydsl(
             bucket[dt] = bucket.get(dt, 0) + cnt
         if shapes and not _DTYPE_OBS["flydsl_shapes"].get(stem):
             _DTYPE_OBS["flydsl_shapes"][stem] = shapes
-        # name -> {dtype, distinct shapes across all launches, launch count}
         abucket = _DTYPE_OBS["flydsl_args"].setdefault(stem, {})
         for name, label, shp in per_arg:
             e = abucket.get(name)
@@ -1409,7 +1473,6 @@ def _record_flydsl(
             e["count"] += 1
             if shp not in e["shapes"]:
                 e["shapes"].append(shp)
-        # stem -> {sig: dispatch_count}; superset of the bare ``count`` above.
         if sig:
             scbucket = _DTYPE_OBS["flydsl_shape_counts"].setdefault(stem, {})
             scbucket[sig] = scbucket.get(sig, 0) + 1
@@ -1419,8 +1482,7 @@ def _record_flydsl(
 
 
 def _patch_flydsl_jit() -> bool:
-    """Wrap ``flydsl.compiler.jit_function.JitFunction.__call__`` to record
-    per-kernel arg dtypes/shapes at kernel launch."""
+    """Wrap FlyDSL ``JitFunction.__call__`` to record arg dtypes and shapes."""
     if not (_dtype_dir() or _is_phase2()):
         return True
     mod = sys.modules.get("flydsl.compiler.jit_function")
@@ -1449,7 +1511,6 @@ def _make_capture_dtype_mode():
 
     class _CaptureDtypeMode(TorchDispatchMode):  # type: ignore[misc]
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            # Execute first so newly appended graph nodes can be claimed.
             result = func(*args, **(kwargs or {}))
             try:
                 kernels = _claim_captured_kernel_nodes()
@@ -1505,7 +1566,6 @@ def _patch_graph_capture() -> bool:
     active: dict = {}
 
     def _begin(self, *a, **k):  # type: ignore[no-untyped-def]
-        # Drop metadata from a prior capture on this object.
         _discard_graph_state(getattr(self, "_profilelens_gid", None))
         gid = _next_graph_id()
         self._profilelens_gid = gid  # type: ignore[attr-defined]
@@ -1521,7 +1581,6 @@ def _patch_graph_capture() -> bool:
         try:
             return orig_begin(self, *a, **k)
         except BaseException:
-            # Restore instrumentation state before propagating failure.
             m = active.pop(id(self), None)
             if m is not None:
                 try:
@@ -1537,7 +1596,6 @@ def _patch_graph_capture() -> bool:
             raise
 
     def _end(self, *a, **k):  # type: ignore[no-untyped-def]
-        # Validate while stream capture is still active.
         gid = getattr(self, "_profilelens_gid", None)
         if gid is not None:
             try:
@@ -1549,7 +1607,6 @@ def _patch_graph_capture() -> bool:
             res = orig_end(self, *a, **k)
         except BaseException:
             end_exc = sys.exc_info()
-            # A failed capture cannot retain replay metadata.
             if gid is not None:
                 _discard_graph_state(gid)
                 try:
@@ -1569,7 +1626,6 @@ def _patch_graph_capture() -> bool:
         return res
 
     def _replay(self, *a, **k):  # type: ignore[no-untyped-def]
-        # Record only successful replay submissions.
         result = orig_replay(self, *a, **k)
         gid = getattr(self, "_profilelens_gid", None)
         if gid is not None:
@@ -1606,8 +1662,6 @@ def _install_dtype_hooks() -> None:
     if getattr(sys, "_profilelens_dtype_installed", False):
         return
     sys._profilelens_dtype_installed = True  # type: ignore[attr-defined]
-    # Key each patch on the EXACT submodule it touches, so the import hook only
-    # fires it after the workload has fully imported that module
     for mod_key, patch_fn in (
         ("triton.runtime.jit", _patch_triton_jit),
         ("triton.runtime.autotuner", _patch_triton_autotuner),

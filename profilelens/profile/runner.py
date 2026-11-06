@@ -15,6 +15,43 @@ from typing import Any
 from rich.console import Console
 
 from profilelens.dtypes import KernelProfile, ProfilingResult, QueryResult
+from profilelens.profile.kernel_context import kernel_time_share
+from profilelens.profile.kernel_names import (
+    add_canonical_aliases,
+    boundary_kernel_name,
+    lookup_kernel,
+)
+
+
+def _raise_if_namespace_mismatch(profile_output: str, kernel_names: list[str]) -> None:
+    from profilelens.profile.parser import parse_kernel_trace
+
+    dispatched = {d.kernel_name for d in parse_kernel_trace(profile_output) if d.kernel_name}
+    if not dispatched or not kernel_names:
+        return
+
+    wanted = {boundary_kernel_name(n) for n in kernel_names}
+    if wanted & {boundary_kernel_name(n) for n in dispatched}:
+        return
+
+    want, saw, best = kernel_names[0], sorted(dispatched)[0], -1
+    for w in kernel_names:
+        cw = boundary_kernel_name(w)
+        for d in dispatched:
+            common = len(os.path.commonprefix([cw, boundary_kernel_name(d)]))
+            if common > best:
+                want, saw, best = w, d, common
+
+    raise RuntimeError(
+        f"rocprofv3 dispatched {len(dispatched)} kernels but --kernel-include-regex "
+        f"matched none of the {len(kernel_names)} requested, so no hardware counters "
+        f"were collected. Phase 1 and Phase 2 disagree on kernel naming.\n"
+        f"  Phase 1 (trace) wants:   {want[:140]}\n"
+        f"  Phase 2 (rocprofv3) saw: {saw[:140]}\n"
+        f"  (longest shared prefix: {best} chars)\n"
+        f"If these differ only by decoration, profilelens.profile.kernel_names needs "
+        f"to learn the new spelling."
+    )
 
 
 def _build_trace_context_map(
@@ -29,12 +66,12 @@ def _build_trace_context_map(
                 name = row.get("name", "")
                 if name and total_ms > 0:
                     ctx[name] = {
-                        "e2e_pct": round(row.get("total_ms", 0) / total_ms * 100, 1),
+                        "e2e_pct": kernel_time_share(row, total_ms),
                         "trace_total_ms": row.get("total_ms", 0),
                         "trace_count": row.get("count", 0),
                     }
             break
-    return ctx
+    return add_canonical_aliases(ctx)
 
 
 def extract_top_k_kernels(
@@ -150,8 +187,6 @@ def merge_rank_analyses(
         if not any(r.label == AGG for r in merged_results):
             merged_results.append(merged_agg)
 
-    # Replace the (rank-0, all-kernel) dispatch durations with the cross-rank,
-    # top-K-filtered set. 
     if prim_disp is not None and extra_per_rank and disp_rows_all:
         merged_disp = QueryResult(
             sql="(merged across ranks, top-K only)", label=DISP,
@@ -160,7 +195,6 @@ def merge_rank_analyses(
         )
         merged_results = [merged_disp if r.label == DISP else r for r in merged_results]
 
-    # EP-asymmetry: do ranks run different kernel sets?
     topk_sets = {rk: set(names) for rk, names in per_rank_topk.items()}
     asymmetric = False
     if len(topk_sets) > 1:
@@ -178,9 +212,7 @@ def merge_rank_analyses(
 
 import re as _re
 
-# Per-rank kineto trace pattern filenames look like:
-#   dp0_pp0_tp3_dcp0_ep3_rank3.<traceid>.pt.trace.json.gz
-# Capture the logical rank and (best effort) the tp/ep coordinates.
+# e.g. dp0_pp0_tp3_dcp0_ep3_rank3.<traceid>.pt.trace.json.gz
 _RANK_RE = _re.compile(r"(?:^|[._])rank(\d+)(?:[._]|$)")
 _TP_RE = _re.compile(r"(?:^|[._])tp(\d+)(?:[._]|$)")
 _EP_RE = _re.compile(r"(?:^|[._])ep(\d+)(?:[._]|$)")
@@ -189,7 +221,6 @@ _EP_RE = _re.compile(r"(?:^|[._])ep(\d+)(?:[._]|$)")
 @dataclass
 class RankTrace:
     """A per-rank kineto trace and its parsed parallelism coordinates."""
-
 
     path: Path
     rank: int | None = None
@@ -234,7 +265,7 @@ def parse_trace_identity(path: Path, peek_bytes: int = 4 * 1024 * 1024) -> tuple
     rank = world = pid = None
     di = text.find('"distributedInfo"')
     if di != -1:
-        seg = text[di:di + 400]  # first-level fields precede the nested pg_config
+        seg = text[di:di + 400]
         m = _DIST_RANK_RE.search(seg)
         if m:
             rank = int(m.group(1))
@@ -244,8 +275,7 @@ def parse_trace_identity(path: Path, peek_bytes: int = 4 * 1024 * 1024) -> tuple
 
     pids = _PID_RE.findall(text)
     if pids:
-        # The worker process dominates the CPU-side events; GPU device/stream
-        # tracks are comparatively rare in the head.
+        # The worker PID dominates CPU-side events.
         pid = int(Counter(pids).most_common(1)[0][0])
 
     return (rank, world, pid)
@@ -282,7 +312,7 @@ def collect_recorded_traces(audit_dir: str | Path) -> list[RankTrace]:
             p = Path(raw)
             if not p.is_file():
                 continue
-            rt = parse_rank_meta(p)  # rank/tp/ep from filename (best effort)
+            rt = parse_rank_meta(p)
             rt.pid = pid
             key: tuple[str, object] = (
                 ("rank", rt.rank) if rt.rank is not None else ("pid", pid)
@@ -295,7 +325,7 @@ def collect_recorded_traces(audit_dir: str | Path) -> list[RankTrace]:
 
 
 def collect_region_paths(audit_dir: str | Path) -> dict[str, str]:
-    """Merge the shim's per-PID """
+    """Merge region-to-trace paths recorded by the worker shim."""
     audit_dir = Path(audit_dir)
     merged: dict[str, str] = {}
     if not audit_dir.is_dir():
@@ -336,11 +366,7 @@ def _representative_ranges(
     merge_rel: float = 0.18,
     max_ranges: int = 14,
 ) -> list[tuple[int, int]]:
-    """Count-aware multi-range iteration selection for per-kernel coverage.
-
-    Each window kernel contributes its own early/mid/late absolute
-    indices.  The first window also covers names split across kernel IDs.
-    """
+    """Pick early/mid/late dispatch-index ranges covering every kernel."""
     counts = [c for c in counts if c and c > 2 * width]
     if not counts:
         return []
@@ -354,8 +380,6 @@ def _representative_ranges(
         if kept and (p - kept[-1]) <= merge_rel * max(p, 1):
             continue
         kept.append(p)
-    # overhead cap: drop the smallest gaps (most redundant), never the sparse
-    # high end, so lifetime span is preserved.
     while len(kept) > max_ranges:
         gaps = [(kept[i + 1] - kept[i], i) for i in range(1, len(kept) - 1)]
         if not gaps:
@@ -449,8 +473,6 @@ def _compute_dispatch_sample(
     ranges = _representative_ranges(window_counts, width=max(2, sample_n // 5))
     if not ranges:
         return None, kernel_cv_map
-    # Expand to a flat sorted iteration-id list (build_command regroups
-    # contiguous runs back into rocprofv3 [lo-hi] tokens).
     iteration_ids = sorted({i for lo, hi in ranges for i in range(lo, hi + 1)})
     max_cv = max(
         (cv.cv_pct for cv in kernel_cv_map.values() if cv.cv_pct >= 0),
@@ -477,7 +499,6 @@ def _compute_dispatch_sample(
         elif cv_info and cv_info.high_cv:
             marker = " [bold red]*[/bold red]"
             has_high_cv = True
-        # samples actually landing in this kernel = ranges whose lo <= its count
         hit = sum(1 for i in iteration_ids if i <= count)
         console.print(f"    {short}: {count} total, {cv_str}{marker} -> ~{hit} samples")
     console.print(f"  Expected counter rows: ~{per_kernel * len(kernel_names) * 20} "
@@ -500,11 +521,10 @@ def _compute_dispatch_sample(
     return iteration_ids, kernel_cv_map
 
 
-def _write_rank_breakdown(profiled, profile_output: str, console: Console) -> None:
-    """Persist per-(kernel, rank) detail and print a multi-rank summary."""
+def _write_rank_breakdown(profiled, profile_output: str, console: Console) -> int:
     max_ranks = max((getattr(a, "n_ranks", 1) for a in profiled), default=1)
     if max_ranks <= 1:
-        return  # single-rank (TP=1) — nothing extra to report.
+        return max_ranks
 
     agents: set[str] = set()
     breakdown: dict[str, Any] = {}
@@ -539,7 +559,6 @@ def _write_rank_breakdown(profiled, profile_output: str, console: Console) -> No
     except OSError:
         pass
 
-    # Flag kernels whose per-rank duration is imbalanced (max/min >= 2x).
     imbalanced = []
     for name, info in breakdown.items():
         durs = [r["avg_us"] for r in info["per_rank"] if r["avg_us"] > 0]
@@ -556,6 +575,28 @@ def _write_rank_breakdown(profiled, profile_output: str, console: Console) -> No
             f"    [yellow]rank imbalance[/yellow] {name[:45]}: "
             f"{lo:.1f}-{hi:.1f} us/dispatch across ranks"
         )
+    return max_ranks
+
+
+def _warn_if_ranks_missing(profile_output: str, observed: int, console: Console) -> None:
+    ranks_json = Path(profile_output).parent / "phase1_ranks.json"
+    try:
+        expected = int(json.loads(ranks_json.read_text()).get("n_ranks", 0))
+    except (OSError, ValueError, TypeError):
+        return
+    if expected <= observed:
+        return
+
+    console.print(
+        f"  [yellow]Rank coverage: Phase 2 collected counters for {observed} of "
+        f"the {expected} ranks Phase 1 observed.[/yellow]\n"
+        f"  [dim]A rank killed during server shutdown leaves its counters "
+        f"unconverted in rocprofv3's staging directory (.rocprofv3/"
+        f"*-counter_values.dat) instead of writing a *_counter_collection.csv. "
+        f"Counters below describe the ranks that did exit cleanly; on an "
+        f"expert-sharded model the missing ranks run different kernels, so treat "
+        f"this as a partial view.[/dim]"
+    )
 
 
 def run_profile(
@@ -564,6 +605,7 @@ def run_profile(
     dtype: str | None = None,
     counter_set_mode: str = "auto",
     custom_counters: list[str] | None = None,
+    counter_dtype_hints: list[str] | None = None,
     run_roofline: bool = True,
     refresh_roofline: bool = False,
     output_dir: str = "./profilelens_run",
@@ -574,31 +616,64 @@ def run_profile(
     profiling_config: dict[str, Any] | None = None,
     per_kernel_dtype: dict[str, tuple[str, str]] | None = None,
     observed_dtypes: list[str] | None = None,
+    workload_timeout: float = 0.0,
+    workload_idle_timeout: float = 1800.0,
 ) -> ProfilingResult:
     """Execute the full profiling pipeline."""
     from profilelens.profile.gpu_detect import detect_gpu
-    from profilelens.profile.counter_sets import (
-        build_custom,
-        select_counter_set,
-    )
+    from profilelens.profile.planning import prepare_counter_plan, prepare_roofline
     from profilelens.profile.rocprofv3 import (
         build_kernel_regex,
-        counter_set_supported,
         find_rocprofv3,
-        list_available_counters,
         run_profile as run_rocprofv3,
     )
-    from profilelens.profile.roofline_bench import run_roofline_benchmark
     from profilelens.profile.parser import parse_and_aggregate
     from profilelens.profile.metrics import compute_kernel_metrics
-    from profilelens.profile.roofline import (
-        build_roofline_peaks,
-        build_roofline_peaks_multi,
-        parse_roofline_csv,
+    from profilelens.profile.dtype_detect import (
+        UNKNOWN_DTYPE,
+        counter_dtype_coverage,
+        normalize_counter_dtype_hints,
+        resolve_kernel_dtypes,
     )
 
     cfg = profiling_config or {}
     con = console or Console()
+    if counter_set_mode not in {"auto", "custom"}:
+        raise ValueError("counter_set_mode must be auto or custom")
+    if custom_counters:
+        counter_set_mode = "custom"
+    elif counter_set_mode == "custom":
+        raise ValueError("The custom counter set requires explicit counters")
+    resolved_dtypes = (dict(per_kernel_dtype) if per_kernel_dtype is not None
+                       else resolve_kernel_dtypes(kernel_names, None)[0])
+    pkd = add_canonical_aliases(dict(resolved_dtypes))
+    observed_dtypes = sorted({dt for dt, _source in resolved_dtypes.values()})
+    unresolved = [name for name in kernel_names
+                  if lookup_kernel(pkd, name, (UNKNOWN_DTYPE, "unresolved"))[0] == UNKNOWN_DTYPE]
+    hints = normalize_counter_dtype_hints(counter_dtype_hints or [])
+    coverage = counter_dtype_coverage(observed_dtypes, bool(unresolved), hints)
+    resolution = {"kernels": {name: {"dtype": dt, "source": source}
+                               for name, (dt, source) in resolved_dtypes.items()},
+                  "unresolved_kernels": unresolved,
+                  "caller_counter_dtype_hints": hints,
+                  "automatic_counter_dtype_coverage": coverage if not custom_counters else [],
+                  "explicit_counters": list(custom_counters or []),
+                  "note": "Counter selection is measurement configuration, not evidence of a kernel's dtype. "
+                          "Collected MFMA families may cover only part of its arithmetic."}
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir) / "dtype_resolution.json").write_text(json.dumps(resolution, indent=2) + "\n")
+    if unresolved:
+        selection = ("explicit counters" if custom_counters else
+                     "caller-guided counter coverage" if hints else
+                     "default counter coverage (" + ", ".join(coverage) + ")")
+        con.print("Compute dtype unresolved for selected kernel(s): "
+                  + ", ".join(unresolved) + ". Continuing with " + selection + ".",
+                  style="yellow", markup=False)
+        con.print("[yellow]MFMA coverage may be incomplete; unresolved kernels remain UNKNOWN and "
+                  "receive no dtype-specific compute ceiling. Use --dtypes BF16,FP8,FP4 to guide "
+                  "coverage or --counters to request explicit SDK counters.[/yellow]")
+    if custom_counters and hints:
+        con.print("[yellow]Explicit --counters take precedence over --dtypes for collection.[/yellow]")
     rocprofv3_path = find_rocprofv3(cfg.get("rocprofv3_path", ""))
 
     con.print("[bold]Step 1:[/bold] Detecting GPU...")
@@ -606,58 +681,38 @@ def run_profile(
     con.print(f"  Detected: {gpu.model} ({gpu.arch}), {gpu.cu_count} CUs")
 
     con.print("[bold]Step 2:[/bold] Selecting counter set...")
-    available_counters = list_available_counters(rocprofv3_path)
-
-    def _compatibility(counters: tuple[str, ...]) -> tuple[bool, str]:
-        return counter_set_supported(rocprofv3_path, counters)
-
-    if counter_set_mode == "custom" and custom_counters:
-        missing = sorted(set(custom_counters) - available_counters)
-        if missing:
-            raise RuntimeError(
-                "custom counters are not reported by this GPU: " + ", ".join(missing)
-            )
-        cset = build_custom(custom_counters)
-        supported, detail = _compatibility(cset.counters)
-        if not supported:
-            raise RuntimeError(
-                "custom counter set cannot be collected in one pass: " + detail
-            )
-    else:
-        cset = select_counter_set(
-            dtype, observed_dtypes,
-            available_counters=available_counters,
-            compatibility=_compatibility,
-            log=lambda m: con.print(f"  [yellow]{m}[/yellow]"),
-        )
+    counter_plan = prepare_counter_plan(
+        rocprofv3_path,
+        observed_dtypes=observed_dtypes,
+        has_unresolved=bool(unresolved),
+        counter_dtype_hints=hints,
+        custom_counters=custom_counters,
+        counter_set_mode=counter_set_mode,
+        log=lambda m: con.print(f"  {m}", style="yellow", markup=False),
+    )
+    cset = counter_plan.counter_set
     if observed_dtypes:
         con.print(f"  Observed dtypes: {', '.join(observed_dtypes)}")
     con.print(f"  Counter set: {cset.name} ({len(cset.counters)} counters)")
 
-    roofline_csv_path = None
     roofline_peaks = None
+    peaks_by_dtype: dict[str, Any] = {}
     if run_roofline:
         con.print("[bold]Step 3:[/bold] Roofline benchmark...")
         try:
-            cache_dir = cfg.get(
-                "roofline_cache_dir",
-                str(Path.home() / ".profilelens" / "roofline_cache"),
+            prepared = prepare_roofline(
+                gpu, counter_plan=counter_plan, observed_dtypes=observed_dtypes,
+                summary_dtype=UNKNOWN_DTYPE if unresolved else (dtype or UNKNOWN_DTYPE),
+                cache_dir=cfg.get("roofline_cache_dir"), refresh=refresh_roofline, console=con,
             )
-            roofline_csv_path = run_roofline_benchmark(
-                cache_dir, gpu.model, console=con, force=refresh_roofline,
-            )
+            roofline_peaks = prepared.peaks
+            peaks_by_dtype = prepared.peaks_by_dtype
         except RuntimeError as exc:
             con.print(f"  [yellow]Roofline benchmark skipped: {exc}[/yellow]")
     else:
         con.print("[bold]Step 3:[/bold] Roofline benchmark [dim](skipped)[/dim]")
 
-    peaks_by_dtype: dict[str, Any] = {}
-    if roofline_csv_path:
-        ceilings = parse_roofline_csv(roofline_csv_path, dtype or "BF16")
-        roofline_peaks = build_roofline_peaks(ceilings, gpu.model, dtype or "BF16")
-        # Per-dtype peaks so each kernel is scored on its own MFMA ceiling.
-        dt_list = list(observed_dtypes) if observed_dtypes else [dtype or "BF16"]
-        peaks_by_dtype = build_roofline_peaks_multi(roofline_csv_path, gpu.model, dt_list)
+    if roofline_peaks:
         con.print(
             f"  HBM BW: {roofline_peaks.peak_bw_tbps.get('hbm', 0):.2f} TB/s, "
             f"MFMA: {roofline_peaks.peak_compute_tflops.get('mfma', 0):.1f} TFLOPS, "
@@ -689,6 +744,8 @@ def run_profile(
     success, stderr = run_rocprofv3(
         rocprofv3_path, profile_output, cset.counters, kernel_regex,
         user_command, console=con, iteration_ids=iteration_ids,
+        workload_timeout=workload_timeout,
+        workload_idle_timeout=workload_idle_timeout,
     )
     profiling_duration = _time.time() - t_profile_start
     if not success:
@@ -711,7 +768,12 @@ def run_profile(
         + (f" ({unprofiled_count} without counters excluded)" if unprofiled_count else "")
     )
 
-    _write_rank_breakdown(profiled, profile_output, con)
+    _warn_if_ranks_missing(
+        profile_output, _write_rank_breakdown(profiled, profile_output, con), con
+    )
+
+    if kernel_regex and not any(a.avg_counters for a in aggregated):
+        _raise_if_namespace_mismatch(profile_output, kernel_names)
 
     if not profiled and analysis_results:
         from profilelens.profile.parser import AggregatedKernel
@@ -736,13 +798,15 @@ def run_profile(
                 f"trace data for top-{len(profiled)} kernels[/yellow]"
             )
 
-    pkd = per_kernel_dtype or {}
-
     def _profiles_from(aggs: list) -> list[KernelProfile]:
         out: list[KernelProfile] = []
         for agg in aggs:
-            kdt, ksrc = pkd.get(agg.kernel_name, (dtype or "BF16", "global"))
-            kpeak = peaks_by_dtype.get(kdt, roofline_peaks)
+            kdt, ksrc = lookup_kernel(pkd, agg.kernel_name, (UNKNOWN_DTYPE, "unresolved"))
+            kpeak = peaks_by_dtype.get(kdt)
+            if kpeak is None and roofline_peaks is not None:
+                from profilelens.dtypes import RooflinePeaks
+                kpeak = RooflinePeaks(gpu.model, kdt,
+                                     peak_bw_tbps=roofline_peaks.peak_bw_tbps)
             out.append(compute_kernel_metrics(
                 agg, kpeak, kdt, gpu_info=gpu, dtype_source=ksrc,
             ))
@@ -766,18 +830,19 @@ def run_profile(
         trace_ctx = _build_trace_context_map(analysis_results)
         scored: list[tuple[float, KernelProfile]] = []
         for kp in kernel_profiles:
-            tc = trace_ctx.get(kp.kernel_name, {})
+            tc = lookup_kernel(trace_ctx, kp.kernel_name, {})
             e2e = tc.get("e2e_pct", 0.0)
             hr = compute_headroom(kp.mfma_util_pct, kp.bw_util_pct, kp.bottleneck, e2e)
-            scored.append((hr.priority_score, kp))
+            score = hr.priority_score if hr.priority_score >= 0 else e2e / 100.0
+            scored.append((score, kp))
         scored.sort(key=lambda x: x[0], reverse=True)
         kernel_profiles = [kp for _, kp in scored]
-        con.print(f"  Re-ranked by optimization priority (headroom x e2e weight)")
+        con.print("  Re-ranked by optimization priority (headroom x e2e weight)")
 
     return ProfilingResult(
         gpu_arch=gpu.arch,
         gpu_model=gpu.model,
-        detected_dtype=dtype or "mixed",
+        detected_dtype=UNKNOWN_DTYPE if unresolved else (dtype or UNKNOWN_DTYPE),
         kernels=tuple(kernel_profiles),
         roofline_peaks=roofline_peaks,
         observed_dtypes=tuple(observed_dtypes or ()),
@@ -795,4 +860,7 @@ def run_profile(
         sample_dispatches_per_kernel=sample_dispatches,
         phase2_workload_s=round(profiling_duration, 1),
         counters_used=tuple(cset.counters),
+        counter_dtype_hints=tuple(hints),
+        counter_dtypes=tuple(coverage if not custom_counters else ()),
+        unresolved_kernels=tuple(unresolved),
     )
