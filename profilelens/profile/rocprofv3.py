@@ -168,6 +168,21 @@ def prepare_patched_rocprofv3(
         _ROCPROF_PATCH_DIR / f"{rocm_major}.x" / "librocprofiler-sdk-tool.so"
     )
     if not patched_tool.is_file():
+        # The region-relative counter-collection fix that ProfileLens bundles as a
+        # patched tool lib for ROCm 7.x (upstream PR ROCm/rocm-systems#7299) is
+        # merged in the rocprofiler-sdk-tool shipped with ROCm 10+ (verified in the
+        # SDK 1.3.5 source: `defer_counter_start` + `create_pause_resume_ctx` gate
+        # the counting context on roctxProfilerResume/Pause). On those releases the
+        # stock tool already does region-relative counting, so run without an
+        # overlay instead of failing.
+        if rocm_major >= 10:
+            if console:
+                console.print(
+                    f"  [yellow]No bundled patched tool lib for ROCm {rocm_major}.x; "
+                    f"using stock rocprofv3 (the region-relative counter fix is "
+                    f"upstream in this SDK).[/yellow]"
+                )
+            return "", ""
         raise RuntimeError(
             f"ProfileLens has no patched tool lib for ROCm {rocm_major}.x: "
             f"{patched_tool} is missing.\n"
@@ -296,12 +311,38 @@ def build_command(
     return cmd
 
 
+def strip_kd_decoration(name: str) -> str:
+    """Strip the ROCm perfetto/kineto kernel-descriptor decoration.
+
+    On ROCm the torch/perfetto trace decorates GPU kernel names with a
+    kernel-descriptor suffix (trailing ``.kd`` and/or `` [clone .kd]``) that
+    rocprofv3's *dispatch* names do not carry. Normalizing to the undecorated
+    form lets trace-derived names (Phase 1) and dispatch names (Phase 2) join.
+    """
+    import re as _re
+
+    n = _re.sub(r"\s*\[clone\s+\.kd\]\s*$", "", name)
+    n = _re.sub(r"\.kd\s*$", "", n)
+    return n
+
+
 def build_kernel_regex(kernel_names: list[str]) -> str:
-    """Build a regex that matches any of the given kernel names exactly."""
+    """Build a regex matching any of the given kernel names.
+
+    Matching the decorated name with an anchored ``^(...)$`` selects zero kernels
+    for counter collection (``--kernel-include-regex``), yielding an empty
+    ``*_counter_collection.csv``. Strip the ``.kd`` decoration and allow it
+    optionally so the include-regex matches the runtime dispatch name.
+    """
     if not kernel_names:
         return ""
     import re as _re
-    return "^(" + "|".join(_re.escape(name) for name in kernel_names) + ")$"
+
+    pats = [
+        _re.escape(strip_kd_decoration(name)) + r"(?:\.kd)?(?:\s*\[clone\s+\.kd\])?"
+        for name in kernel_names
+    ]
+    return "^(" + "|".join(pats) + ")$"
 
 
 def run_profile(
@@ -327,6 +368,12 @@ def run_profile(
     final_command = user_command
     server_mode = server_info is not None
 
+    # Region-relative --selected-regions requires ProfileLens's patched tool lib.
+    # On a stock (non-region-relative) rocprofv3 it records nothing even though
+    # roctx markers fire, so allow opting out: profile ALL dispatches of the
+    # top-K kernels (scoped by --kernel-include-regex) across the run instead.
+    _selected_regions = os.environ.get("PROFILELENS_SELECTED_REGIONS", "true").lower() != "false"
+
     if server_mode:
         rocp_prefix = build_command(
             rocprofv3_path, output_dir, counters, kernel_regex,
@@ -334,6 +381,7 @@ def run_profile(
             iteration_ids=iteration_ids,
             disable_signal_handlers=True,
             kernel_trace=False,
+            selected_regions=_selected_regions,
             rocm_root=rocm_root,
         )
         if rocp_prefix and rocp_prefix[-1] == "--":
@@ -355,6 +403,7 @@ def run_profile(
         cmd = build_command(
             rocprofv3_path, output_dir, counters, kernel_regex, user_command,
             iteration_ids=iteration_ids,
+            selected_regions=_selected_regions,
             rocm_root=rocm_root,
         )
 
