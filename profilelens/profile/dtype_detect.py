@@ -9,6 +9,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+UNKNOWN_DTYPE = "UNKNOWN"
+DEFAULT_COUNTER_DTYPES = ("BF16", "FP16", "FP8")
+
 _PYTORCH_TO_INTERNAL: dict[str, str] = {
     "BFloat16": "BF16",
     "torch.bfloat16": "BF16",
@@ -47,8 +50,9 @@ _PYTORCH_TO_INTERNAL: dict[str, str] = {
 _COMPUTE_DTYPES = {"BF16", "FP16", "FP8", "FP32", "FP64"}
 
 _DTYPE_COUNTER_ALIAS: dict[str, str] = {
-    "FP4": "FP8", "MXFP4": "FP8", "NVFP4": "FP8",
-    "FP6": "FP8", "MXFP6": "FP8", "MXFP8": "FP8",
+    "FP4": "F6F4", "MXFP4": "F6F4", "NVFP4": "F6F4",
+    "FP6": "F6F4", "MXFP6": "F6F4", "MXFP8": "FP8",
+    "F8": "FP8", "F16": "FP16", "F32": "FP32", "F64": "FP64",
     "INT4": "INT8", "NF4": "FP8",
 }
 
@@ -56,6 +60,7 @@ _MFMA_COUNTER_FOR_DTYPE: dict[str, str] = {
     "BF16": "SQ_INSTS_VALU_MFMA_MOPS_BF16",
     "FP16": "SQ_INSTS_VALU_MFMA_MOPS_F16",
     "FP8": "SQ_INSTS_VALU_MFMA_MOPS_F8",
+    "F6F4": "SQ_INSTS_VALU_MFMA_MOPS_F6F4",
     "FP32": "SQ_INSTS_VALU_MFMA_MOPS_F32",
     "FP64": "SQ_INSTS_VALU_MFMA_MOPS_F64",
     "INT8": "SQ_INSTS_VALU_MFMA_MOPS_I8",
@@ -73,11 +78,30 @@ def counter_dtype(dtype: str) -> str:
     return _DTYPE_COUNTER_ALIAS.get(dt, dt)
 
 
-def mfma_counter_for_dtype(dtype: str) -> str:
+def mfma_counter_for_dtype(dtype: str) -> str | None:
     """Return the MFMA counter name for a given internal dtype."""
-    return _MFMA_COUNTER_FOR_DTYPE.get(
-        counter_dtype(dtype), "SQ_INSTS_VALU_MFMA_MOPS_BF16"
-    )
+    return _MFMA_COUNTER_FOR_DTYPE.get(counter_dtype(dtype))
+
+
+def normalize_counter_dtype_hints(dtypes: list[str] | tuple[str, ...]) -> list[str]:
+    """Validate caller hints without assigning them to individual kernels."""
+    normalized = list(dict.fromkeys(normalize_dtype(dtype.strip()) for dtype in dtypes))
+    invalid = [dtype for dtype in normalized if mfma_counter_for_dtype(dtype) is None]
+    if invalid:
+        raise ValueError("Unsupported counter dtype hint(s): " + ", ".join(invalid))
+    return normalized
+
+
+def counter_dtype_coverage(
+    observed_dtypes: list[str] | tuple[str, ...],
+    unresolved: bool,
+    hints: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """Choose MFMA counter families; this is not kernel dtype inference."""
+    known = [dtype for dtype in observed_dtypes if mfma_counter_for_dtype(dtype)]
+    requested = normalize_counter_dtype_hints(hints)
+    fallback = DEFAULT_COUNTER_DTYPES if not requested and (unresolved or not known) else ()
+    return list(dict.fromkeys([*known, *requested, *fallback]))
 
 
 def mfma_counters_for_dtypes(dtypes: "set[str] | tuple[str, ...] | list[str]") -> list[str]:
@@ -90,7 +114,6 @@ def mfma_counters_for_dtypes(dtypes: "set[str] | tuple[str, ...] | list[str]") -
     return sorted(out.keys())
 
 
-# Kernel-name dtype tokens
 _KERNEL_NAME_DTYPE_TOKENS: tuple[tuple[str, str], ...] = (
     ("bfloat16", "BF16"), ("bf16", "BF16"), ("_bbs_", "BF16"), ("hip_bfloat16", "BF16"),
     ("float16", "FP16"), ("__half", "FP16"), ("fp16", "FP16"), ("_hhs_", "FP16"),
@@ -104,7 +127,7 @@ _KERNEL_NAME_DTYPE_TOKENS: tuple[tuple[str, str], ...] = (
 
 
 def dtype_from_kernel_name(kernel_name: str) -> str | None:
-    """get compute dtype from the kernel symbol."""
+    """Infer a compute dtype from tokens in the kernel symbol."""
     lower = kernel_name.lower()
     for token, dtype in _KERNEL_NAME_DTYPE_TOKENS:
         if token in lower:
@@ -112,7 +135,6 @@ def dtype_from_kernel_name(kernel_name: str) -> str | None:
     return None
 
 
-# torch dtype string (str(tensor.dtype)) -> internal compute dtype.
 _TORCH_DTYPE_TO_INTERNAL: dict[str, str] = {
     "torch.bfloat16": "BF16",
     "torch.float16": "FP16", "torch.half": "FP16",
@@ -131,9 +153,9 @@ def torch_dtype_to_internal(dtype_str: str) -> str | None:
 def dtype_from_query_result(rows: tuple[dict[str, Any], ...] | None) -> str:
     """Pick the dominant compute dtype from CPU_OP_INPUT_TYPES query rows."""
     if not rows:
-        return "BF16"
+        return UNKNOWN_DTYPE
 
-    best_dtype = "BF16"
+    best_dtype = UNKNOWN_DTYPE
     best_count = 0
     for row in rows:
         raw = row.get("dtype", "")
@@ -239,7 +261,6 @@ def _merge_flydsl_args(
                     entry["shapes"].append(shp)
 
 
-# Precision rank for compute-dtype attribution
 _PRECISION_RANK: dict[str, int] = {
     "MXFP4": -2, "FP4": -2, "NVFP4": -2, "NF4": -2,
     "INT4": -1, "FP8": 0, "MXFP8": 0, "INT8": 0,
@@ -248,8 +269,7 @@ _PRECISION_RANK: dict[str, int] = {
 
 
 def _argmax_dtype(counts: dict[str, int]) -> str | None:
-    """Most-frequently-observed dtype — used only for the non-kernel-specific
-    capture-dominant fallback, where 'most common seen' is the safest guess."""
+    """Return the most frequently observed dtype."""
     best, best_n = None, -1
     for dt, n in counts.items():
         if n > best_n:
@@ -263,7 +283,7 @@ def _lowest_precision_dtype(counts: dict[str, int]) -> str | None:
     for dt, n in counts.items():
         if n <= 0:
             continue
-        key = (_PRECISION_RANK.get(dt, 5), -n)  # lower rank wins; then more frequent
+        key = (_PRECISION_RANK.get(dt, 5), -n)  # lower rank wins, then more frequent
         if best_key is None or key < best_key:
             best, best_key = dt, key
     return best
@@ -282,7 +302,7 @@ def _triton_lookup(kernel_name: str, triton: dict[str, dict[str, int]]) -> str |
 
 
 def _flydsl_stem(name: str | None) -> str | None:
-    """MLIR DSL (e.g. FlyDSL launcher/GPU symbol)"""
+    """Normalize a FlyDSL launcher or kernel symbol to its stem."""
     if not name:
         return None
     i = len(name)
@@ -304,7 +324,6 @@ def _flydsl_lookup(kernel_name: str, flydsl: dict[str, dict[str, int]]) -> str |
     stem = _flydsl_stem(kernel_name)
     if stem and stem in flydsl:
         return _lowest_precision_dtype(flydsl[stem])
-    # Fallback: stem-substring either direction (handles fused/suffixed symbols).
     for fname, counts in flydsl.items():
         if fname and stem and (stem in fname or fname in stem):
             return _lowest_precision_dtype(counts)
@@ -455,7 +474,7 @@ def _graph_aten_lookup(
         return None
     low = kernel_name.lower()
     squashed = low.replace("_", "")
-    # Longest token first: prefer "layer_norm" over a shorter accidental hit.
+    # Longest token first.
     for tok in sorted(aten_dtypes, key=len, reverse=True):
         if tok in low or tok in squashed:
             return _lowest_precision_dtype(aten_dtypes[tok])
@@ -526,7 +545,7 @@ def flydsl_stem_collisions(
     kernel_names: "list[str] | tuple[str, ...]",
     flydsl_args: dict[str, dict[str, Any]] | None,
 ) -> list[str]:
-    """TODO: initial kernel to cpu mapping, currently only handles 1:1."""
+    """Warn when one FlyDSL stem matches several kernel symbols."""
     if not flydsl_args:
         return []
     warnings: list[str] = []
@@ -557,20 +576,17 @@ def resolve_kernel_dtypes(
     trace_dtypes: dict[str, str] | None = None,
     global_dtype: str | None = None,
 ) -> tuple[dict[str, tuple[str, str]], list[str]]:
-    """Resolve a compute dtype per kernel"""
+    """Resolve each kernel's dtype from kernel-specific evidence only."""
     sidecar = sidecar or {}
     triton = sidecar.get("triton", {})
     flydsl = sidecar.get("flydsl", {})
-    capture_dtypes = sidecar.get("capture_dtypes", {})
     graph_stems = graph_stem_dtypes(sidecar.get("capture_graphs"))
     graph_atens = graph_aten_dtypes(sidecar.get("capture_graphs"))
     trace_dtypes = trace_dtypes or {}
-    capture_dominant = _argmax_dtype(capture_dtypes) if capture_dtypes else None
 
     per_kernel: dict[str, tuple[str, str]] = {}
     observed: dict[str, None] = {}
 
-    # observed_dtypes = exactly the dtypes assigned to the top-K kernels
     for name in kernel_names:
         dt = _triton_lookup(name, triton)
         src = "triton_hook"
@@ -579,7 +595,6 @@ def resolve_kernel_dtypes(
             if dt is not None:
                 src = "flydsl_hook"
         if dt is None:
-            # Prefer capture-specific observations for replayed kernels.
             dt = _graph_lookup(name, graph_stems)
             if dt is None:
                 dt = _graph_aten_lookup(name, graph_atens)
@@ -587,14 +602,12 @@ def resolve_kernel_dtypes(
                 src = "graph_capture"
         if dt is None and name in trace_dtypes:
             dt, src = trace_dtypes[name], "trace_corr"
-        if dt is None and capture_dominant is not None:
-            dt, src = capture_dominant, "capture"
         if dt is None:
             sniffed = dtype_from_kernel_name(name)
             if sniffed is not None:
                 dt, src = sniffed, "name_fallback"
         if dt is None:
-            dt, src = (global_dtype or "BF16"), "global"
+            dt, src = UNKNOWN_DTYPE, "unresolved"
         per_kernel[name] = (dt, src)
         observed[dt] = None
 
@@ -605,13 +618,13 @@ def dtype_from_analysis_json(path: str | Path) -> str:
     """Extract dominant dtype from a saved analyze JSON output."""
     p = Path(path)
     if not p.exists():
-        return "BF16"
+        return UNKNOWN_DTYPE
 
     try:
         with open(p) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return "BF16"
+        return UNKNOWN_DTYPE
 
     if isinstance(data, list):
         for entry in data:
@@ -619,4 +632,4 @@ def dtype_from_analysis_json(path: str | Path) -> str:
                 rows = entry.get("rows", [])
                 return dtype_from_query_result(tuple(rows))
 
-    return "BF16"
+    return UNKNOWN_DTYPE

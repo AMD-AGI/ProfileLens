@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,7 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from rich.console import Console
 
-# ProfileLens ships a region-relative patched librocprofiler-sdk-tool.so here rocprof-patch/7.x/.
+# Bundled region-relative librocprofiler-sdk-tool.so overlays.
 _ROCPROF_PATCH_DIR = Path(__file__).resolve().parents[2] / "rocprof-patch"
 
 
@@ -35,7 +34,6 @@ def find_rocprofv3(config_path: str = "") -> str:
     if rocm_path.is_file():
         return str(rocm_path)
 
-    # In multi-ROCm setup, pick the highest rocprofv3 version.
     for cand in sorted(_glob.glob("/opt/rocm-*/bin/rocprofv3"), reverse=True):
         if Path(cand).is_file() and os.access(cand, os.X_OK):
             return cand
@@ -133,7 +131,7 @@ def _read_rocprofv3_versions(rocprofv3_path: str) -> tuple[int | None, int | Non
             text=True,
             timeout=60,
         ).stdout
-    except Exception as e:  # noqa: BLE001 -- surfaced as a hard failure below
+    except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             f"could not run `{rocprofv3_path} --version`: {e}"
         ) from e
@@ -150,9 +148,18 @@ def prepare_patched_rocprofv3(
     work_dir: str,
     console: Console | None = None,
 ) -> tuple[str, str]:
-    """Build a ``--rocm-root`` prefix that overlays ProfileLens's region-relative
-    patched ``librocprofiler-sdk-tool.so`` over stock rocprof."""
+    """Use native selected-region counting (SDK >= 1.4.1) or the bundled overlay."""
+    # 1.4.1 is the first SDK with the counter-context deferral (rocm-systems #6930).
     sdk_major, rocm_major, raw = _read_rocprofv3_versions(rocprofv3_path)
+    version_match = re.search(r"(?m)^\s*version:\s*(\d+)\.(\d+)\.(\d+)", raw)
+    sdk_version = tuple(map(int, version_match.groups())) if version_match else ()
+    if sdk_major == 1 and sdk_version >= (1, 4, 1):
+        if console:
+            console.print(
+                "  [bold green]Using native rocprofv3 selected-region counting[/bold green] "
+                f"(SDK {'.'.join(map(str, sdk_version))})"
+            )
+        return "", ""
     if sdk_major != 1 or rocm_major is None or rocm_major < 7:
         raise RuntimeError(
             "ProfileLens requires a patchable rocprofv3 (rocprofiler-sdk "
@@ -175,8 +182,7 @@ def prepare_patched_rocprofv3(
             "region-relative patch (see rocprof-patch/<major>.x/README.md)."
         )
 
-    # System ROCm lib dir: .../bin/rocprofv3 -> .../lib
-    install_root = Path(rocprofv3_path).resolve().parent.parent
+    install_root = Path(rocprofv3_path).resolve().parent.parent  # .../bin/rocprofv3 -> install root
     sys_lib = install_root / "lib"
     sys_tool_dir = sys_lib / "rocprofiler-sdk"
     if not sys_tool_dir.is_dir():
@@ -184,7 +190,6 @@ def prepare_patched_rocprofv3(
             f"could not locate the ROCm lib dir for {rocprofv3_path} "
             f"(expected {sys_tool_dir} to exist)."
         )
-
 
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -208,7 +213,6 @@ def prepare_patched_rocprofv3(
     for f in sys_tool_dir.glob("*"):
         _relink(f.resolve(), ptool_dir / f.name)
 
-    # correctly symlink .so.1.1.0 with the conventional .so.1 / .so
     for f in list(ptool_dir.glob("librocprofiler-sdk-tool.so*")):
         f.unlink()
     real_tool = ptool_dir / "librocprofiler-sdk-tool.so.1.1.0"
@@ -216,13 +220,11 @@ def prepare_patched_rocprofv3(
     _relink("librocprofiler-sdk-tool.so.1.1.0", ptool_dir / "librocprofiler-sdk-tool.so.1")
     _relink("librocprofiler-sdk-tool.so.1", ptool_dir / "librocprofiler-sdk-tool.so")
 
-    # Mirror share/rocprofiler-sdk (counter definitions) for the relative lookup.
     metrics_path = ""
     sys_share = install_root / "share" / "rocprofiler-sdk"
     if sys_share.is_dir():
-        _relink(sys_share.resolve(), prefix / "share")  # prefix/share -> .../share/rocprofiler-sdk
+        _relink(sys_share.resolve(), prefix / "share")
         metrics_path = str(sys_share.resolve())
-        # prefix/lib/../share/rocprofiler-sdk must also resolve; provide that name too.
         (prefix / "share").unlink()
         (prefix / "share").mkdir(exist_ok=True)
         _relink(sys_share.resolve(), prefix / "share" / "rocprofiler-sdk")
@@ -246,7 +248,7 @@ def build_command(
     output_format: str = "csv",
     iteration_ids: list[int] | None = None,
     disable_signal_handlers: bool = True,
-    process_sync: bool = True,
+    process_sync: bool = False,
     kernel_trace: bool = True,
     selected_regions: bool = True,
     marker_trace: bool = True,
@@ -266,8 +268,8 @@ def build_command(
     if disable_signal_handlers:
         cmd.extend(["--disable-signal-handlers", "true"])
 
-    if process_sync:
-        cmd.extend(["--process-sync", "true"])
+    # Peer sync can deadlock a parent waiting on its child.
+    cmd.extend(["--process-sync", "true" if process_sync else "false"])
 
     if selected_regions:
         cmd.extend(["--selected-regions", "true"])
@@ -301,7 +303,28 @@ def build_kernel_regex(kernel_names: list[str]) -> str:
     if not kernel_names:
         return ""
     import re as _re
-    return "^(" + "|".join(_re.escape(name) for name in kernel_names) + ")$"
+
+    from profilelens.profile.kernel_names import kernel_name_variants
+
+    alternatives: list[str] = []
+    seen: set[str] = set()
+    for name in kernel_names:
+        for variant in kernel_name_variants(name):
+            if variant and variant not in seen:
+                seen.add(variant)
+                alternatives.append(_re.escape(variant))
+    if not alternatives:
+        return ""
+    return "^(" + "|".join(alternatives) + ")$"
+
+
+def _looks_like_script_entry(user_command: list[str]) -> bool:
+    """True when the workload is launched through a shell script."""
+    if not user_command:
+        return False
+    if os.path.basename(user_command[0]) in {"bash", "sh"} and len(user_command) >= 2:
+        return True
+    return user_command[0].endswith((".sh", ".bash"))
 
 
 def run_profile(
@@ -312,13 +335,14 @@ def run_profile(
     user_command: list[str],
     console: Console | None = None,
     iteration_ids: list[int] | None = None,
+    workload_timeout: float = 0.0,
+    workload_idle_timeout: float = 1800.0,
 ) -> tuple[bool, str]:
     """Execute rocprofv3 and return (success, stderr_output)."""
-    from profilelens.profile.server_mode import detect_server, build_wrapper_script
+    from profilelens.profile.server_mode import build_wrapper_script, detect_server
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Region-relative PMC is mandatory for correct counter attribution; fail if patched rocprofv3 cannot be used
     rocm_root, metrics_path = prepare_patched_rocprofv3(
         rocprofv3_path, output_dir, console=console
     )
@@ -357,6 +381,14 @@ def run_profile(
             iteration_ids=iteration_ids,
             rocm_root=rocm_root,
         )
+        if console and _looks_like_script_entry(user_command):
+            console.print(
+                "  [yellow]No server launch recognized in this script; rocprofv3 "
+                "will instrument the entire process tree.[/yellow]\n"
+                "  [dim]Helpers also inherit instrumentation. Peer synchronization "
+                "is disabled; the workload must stop and join its workers so their "
+                "per-process profiling output is flushed before returning.[/dim]"
+            )
 
     cmd_log_path = os.path.join(output_dir, "rocprofv3_cmd.log")
     with open(cmd_log_path, "w") as f:
@@ -375,12 +407,12 @@ def run_profile(
     child_env["PYTHONPATH"] = (
         shim_dir + os.pathsep + existing_pp if existing_pp else shim_dir
     )
-    child_env["PROFILELENS_ROCPROF_FINALIZE"] = "1"
+    child_env["PROFILELENS_ROCPROF_FINALIZE"] = "fork"
     audit_dir = os.path.join(output_dir, ".profilelens_audit")
     os.makedirs(audit_dir, exist_ok=True)
     child_env["PROFILELENS_AUDIT_DIR"] = audit_dir
     child_env["PROFILELENS_PHASE2"] = "1"
-    # Reuse Phase 1's graph-kernel inventory when available.
+    child_env["PROFILELENS_NATIVE_SELECTED_REGIONS"] = "0" if rocm_root else "1"
     if "PROFILELENS_GRAPH_PLAN" not in child_env:
         base = Path(output_dir)
         for candidate in (base / ".profilelens_dtype_phase1",
@@ -391,13 +423,17 @@ def run_profile(
     if metrics_path:
         child_env["ROCPROFILER_METRICS_PATH"] = metrics_path
     lib_dir = Path(rocm_root) / "lib"
-    if lib_dir.is_dir():
+    if rocm_root and lib_dir.is_dir():
         existing_ld = child_env.get("LD_LIBRARY_PATH", "")
         child_env["LD_LIBRARY_PATH"] = (
             str(lib_dir) + os.pathsep + existing_ld if existing_ld else str(lib_dir)
         )
 
-    from profilelens.profile._proc_utils import reap_process_group
+    from profilelens.profile._proc_utils import (
+        WorkloadTimeout,
+        reap_process_group,
+        wait_with_watchdog,
+    )
 
     try:
         with open(stdout_path, "w") as so, open(stderr_path, "w") as se:
@@ -406,16 +442,21 @@ def run_profile(
                 start_new_session=True,
             )
             try:
-                returncode = proc.wait(timeout=3600)
+                returncode = wait_with_watchdog(
+                    proc,
+                    wall_timeout=workload_timeout,
+                    idle_timeout=workload_idle_timeout,
+                    progress_paths=(stdout_path, stderr_path),
+                )
             finally:
-                reap_process_group(proc.pid, console=console, label="Phase 2")
-    except subprocess.TimeoutExpired:
-        reap_process_group(proc.pid, console=console, label="Phase 2 (timeout)")
-        return False, "rocprofv3 timed out after 3600s"
+                reap_process_group(proc.pid, console=console, label="Phase 2", log_dir=output_dir)
+    except WorkloadTimeout as exc:
+        reap_process_group(proc.pid, console=console, label="Phase 2 (timeout)", log_dir=output_dir)
+        return False, f"rocprofv3 workload {exc.reason}"
     except FileNotFoundError:
         return False, f"rocprofv3 not found at {rocprofv3_path}"
 
-    class _R:  # minimal shim so the existing returncode check below still works
+    class _R:
         pass
     result = _R()
     result.returncode = returncode

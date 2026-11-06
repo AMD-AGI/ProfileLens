@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import math
 import os
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from profilelens.profile.kernel_names import canonical_kernel_name
 
 
 @dataclass
@@ -31,10 +34,8 @@ class KernelDispatch:
     workgroup_size: str = ""
     vgpr_count: str = ""
 
-    # Joins sampled counter rows to complete kernel-trace rows.
     dispatch_id: str = ""
 
-    # Prevents positional attribution across independent queues.
     queue_id: str = ""
 
 
@@ -42,8 +43,8 @@ class KernelDispatch:
 class RankAggregate:
     """Aggregated data for one kernel on one rank (one GPU)."""
 
-    rank_key: str          # the Process_Id (stable per-rank discriminator)
-    agent_id: str          # GPU agent string, e.g. "Agent 2"
+    rank_key: str
+    agent_id: str
     dispatch_count: int = 0
     total_duration_ns: int = 0
     avg_duration_ns: float = 0.0
@@ -65,8 +66,6 @@ class AggregatedKernel:
     avg_duration_ns: float = 0.0
     avg_counters: dict[str, float] = field(default_factory=dict)
     total_counters: dict[str, float] = field(default_factory=dict)
-    # Per-dispatch (cycles_grbm, duration_ns) pairs preserved for sclk
-    # derivation in metrics. Empty when GRBM_COUNT not in the PMC set.
     grbm_dispatches: tuple[tuple[float, int], ...] = ()
 
     dispatches: tuple[tuple[dict[str, float], int], ...] = ()
@@ -132,9 +131,7 @@ class RegionMarker(tuple):
 
 def _kernel_symbol_key(name: str) -> str:
     """Match the worker shim's stable key for a profiler kernel symbol."""
-    name = (name or "").strip()
-    if name.startswith("void "):
-        name = name[5:]
+    name = canonical_kernel_name(name)
     if not name:
         return ""
     return hashlib.sha1(
@@ -165,12 +162,23 @@ def _safe_float(val: str) -> float:
 
 def _safe_int(val: str) -> int:
     try:
-        return int(float(val))
+        # int() first: timestamps exceed float precision.
+        return int(val)
     except (ValueError, TypeError):
-        return 0
+        try:
+            return int(float(val))
+        except (ValueError, TypeError, OverflowError):
+            return 0
 
 
-def parse_kernel_trace(output_dir: str) -> list[KernelDispatch]:
+def _csv_pid(row: dict, stem_pid: str, overrides: dict[str, str] | None = None) -> str:
+    pid = str(row.get("Process_Id") or row.get("Process_ID") or row.get("process-id") or stem_pid)
+    return stem_pid if overrides and overrides.get(stem_pid) == pid else pid
+
+
+def parse_kernel_trace(
+    output_dir: str, *, process_id_overrides: dict[str, str] | None = None,
+) -> list[KernelDispatch]:
     """Parse all kernel_trace CSVs for timing data."""
     csv_paths = _find_all_csvs(output_dir, "*kernel_trace*.csv")
     if not csv_paths:
@@ -178,7 +186,6 @@ def parse_kernel_trace(output_dir: str) -> list[KernelDispatch]:
 
     dispatches = []
     for csv_path in csv_paths:
-        # Kernel-trace CSVs may expose PID only in the filename.
         stem_pid = os.path.basename(csv_path).split("_", 1)[0]
         if not stem_pid.isdigit():
             stem_pid = ""
@@ -193,8 +200,7 @@ def parse_kernel_trace(output_dir: str) -> list[KernelDispatch]:
                 dur = end - start if end > start else _safe_int(row.get("DurationNs", "0"))
                 dispatches.append(KernelDispatch(
                     kernel_name=name, start_ns=start, end_ns=end, duration_ns=dur,
-                    process_id=(row.get("Process_Id") or row.get("Process_ID")
-                                or row.get("process-id") or stem_pid),
+                    process_id=_csv_pid(row, stem_pid, process_id_overrides),
                     agent_id=(row.get("Agent_Id") or row.get("Agent_ID") or ""),
                     kernel_id=(row.get("Kernel_Id") or row.get("Kernel_ID") or ""),
                     dispatch_id=(row.get("Dispatch_Id")
@@ -205,7 +211,10 @@ def parse_kernel_trace(output_dir: str) -> list[KernelDispatch]:
     return dispatches
 
 
-def parse_counter_collection(output_dir: str) -> list[KernelDispatch]:
+def parse_counter_collection(
+    output_dir: str, *, process_id_overrides: dict[str, str] | None = None,
+    strict: bool = False,
+) -> list[KernelDispatch]:
     """Parse all counter_collection CSVs for per-dispatch HW counter values."""
     csv_paths = _find_all_csvs(output_dir, "*counter_collection*.csv")
     if not csv_paths:
@@ -226,12 +235,14 @@ def parse_counter_collection(output_dir: str) -> list[KernelDispatch]:
             is_long_format = "Counter_Name" in headers and "Counter_Value" in headers
 
             if is_long_format:
-                dispatches = _parse_counter_long(reader)
+                dispatches = _parse_counter_long(reader, strict=strict)
             else:
-                dispatches = _parse_counter_wide(reader)
+                dispatches = _parse_counter_wide(reader, strict=strict)
 
             for d in dispatches:
-                if not d.process_id:
+                if not d.process_id or (
+                    process_id_overrides and process_id_overrides.get(stem_pid) == d.process_id
+                ):
                     d.process_id = stem_pid
                 key = (
                     d.process_id,
@@ -244,11 +255,25 @@ def parse_counter_collection(output_dir: str) -> list[KernelDispatch]:
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_dispatches.append(d)
+                elif strict:
+                    raise ValueError(f"duplicate PMC dispatch across files: {key}")
 
     return all_dispatches
 
 
-def _parse_counter_long(reader: csv.DictReader) -> list[KernelDispatch]:
+def _counter_value(value: str, *, strict: bool = False) -> float | None:
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        if strict:
+            raise ValueError(f"invalid hardware counter value: {value!r}") from None
+        return None
+    if strict and not math.isfinite(number):
+        raise ValueError(f"nonfinite hardware counter value: {value!r}")
+    return number
+
+
+def _parse_counter_long(reader: csv.DictReader, *, strict: bool = False) -> list[KernelDispatch]:
     """Parse the long/melted format: one row per (dispatch, counter)."""
     dispatch_map: dict[tuple[str, str, str, str, str, int, int], KernelDispatch] = {}
 
@@ -266,8 +291,6 @@ def _parse_counter_long(reader: csv.DictReader) -> list[KernelDispatch]:
         queue_id = (row.get("Queue_Id") or row.get("Queue_ID") or "").strip()
         start = _safe_int(row.get("Start_Timestamp", "0"))
         end = _safe_int(row.get("End_Timestamp", "0"))
-        # Correlation IDs may repeat across graph replays, so include timestamps
-        # when no dispatch ordinal is available.
         key = (
             pid,
             agent_id,
@@ -292,15 +315,21 @@ def _parse_counter_long(reader: csv.DictReader) -> list[KernelDispatch]:
                 queue_id=queue_id,
             )
 
+        dispatch = dispatch_map[key]
+        if strict and (dispatch.start_ns != start or dispatch.end_ns != end):
+            raise ValueError(f"conflicting timestamps in PMC dispatch: {key}")
         counter_name = row.get("Counter_Name", "")
-        counter_value = _safe_float(row.get("Counter_Value", "0"))
+        if strict and counter_name in dispatch.counters:
+            raise ValueError(f"duplicate hardware counter {counter_name!r} in PMC dispatch: {key}")
+        counter_value = _counter_value(row.get("Counter_Value", ""), strict=strict)
         if counter_name:
-            dispatch_map[key].counters[counter_name] = counter_value
+            if counter_value is not None:
+                dispatch.counters[counter_name] = counter_value
 
     return list(dispatch_map.values())
 
 
-def _parse_counter_wide(reader: csv.DictReader) -> list[KernelDispatch]:
+def _parse_counter_wide(reader: csv.DictReader, *, strict: bool = False) -> list[KernelDispatch]:
     """Parse the wide format: one row per dispatch with counter columns."""
     _skip_cols = {
         "Kernel_Name", "Name", "gpu-id", "queue-id", "process-id",
@@ -320,8 +349,8 @@ def _parse_counter_wide(reader: csv.DictReader) -> list[KernelDispatch]:
         for k, v in row.items():
             if k in _skip_cols:
                 continue
-            fv = _safe_float(v)
-            if fv != 0.0 or (isinstance(v, str) and v.strip() == "0"):
+            fv = _counter_value(v, strict=strict)
+            if fv is not None:
                 counters[k] = fv
 
         start = _safe_int(row.get("Start_Timestamp", "0"))
@@ -346,11 +375,9 @@ def _parse_counter_wide(reader: csv.DictReader) -> list[KernelDispatch]:
     return dispatches
 
 
-# Substring that marks an MFMA matrix-FLOP counter
 _MFMA_COUNTER_MARK = "MFMA_MOPS"
 
-# Minimum fraction that must read MFMA > 0 for the matrix-FLOP reading
-_MFMA_PRESENCE_MIN = 0.75
+_MFMA_PRESENCE_MIN = 0.75  # min fraction of dispatches with nonzero MFMA
 
 
 def _is_leaked_mfma(key: str, vals: list[float]) -> bool:
@@ -407,9 +434,9 @@ def _combine_ranks(
 ) -> AggregatedKernel:
     """Combine per-rank aggregates into a per-rank-representative kernel."""
 
-    mean = lambda xs: (sum(xs) / len(xs)) if xs else 0.0
+    def mean(xs):
+        return (sum(xs) / len(xs)) if xs else 0.0
 
-    # Don't count empty counter ranks
     src = [r for r in ranks if r.avg_counters] or list(ranks)
     nr = len(src)
 
@@ -417,7 +444,6 @@ def _combine_ranks(
     total_duration_ns = int(mean([r.total_duration_ns for r in src]))
     avg_duration_ns = mean([r.avg_duration_ns for r in src])
 
-    # Mean across ranks of each counter (avg and total flavours).
     avg_keys: set[str] = set()
     tot_keys: set[str] = set()
     for r in src:
@@ -426,11 +452,9 @@ def _combine_ranks(
     avg_counters = {k: mean([r.avg_counters.get(k, 0.0) for r in src]) for k in avg_keys}
     total_counters = {k: mean([r.total_counters.get(k, 0.0) for r in src]) for k in tot_keys}
 
-    # GRBM pairs: union across counter ranks (sclk derivation is rank-agnostic).
     grbm: list[tuple[float, int]] = []
     for r in src:
         grbm.extend(r.grbm_dispatches)
-
 
     disp: list[tuple[dict[str, float], int]] = []
     for r in src:
@@ -452,7 +476,6 @@ def _combine_ranks(
     )
 
 
-
 _VARIANT_FIELDS: tuple[tuple[str, str], ...] = (
     ("grid", "grid_size"),
     ("wg", "workgroup_size"),
@@ -466,10 +489,9 @@ def _variant_sig(d: KernelDispatch) -> str:
 
 
 def _variant_label_for_group(variant_sigs: list[str]) -> dict[str, str]:
-    uniq = list(dict.fromkeys(variant_sigs))  # de-dup, preserve order
+    uniq = list(dict.fromkeys(variant_sigs))
     split = {s: s.split("/") for s in uniq}
     n = len(_VARIANT_FIELDS)
-    # Field positions whose value is not the same across every variant.
     differing = [
         i for i in range(n)
         if len({split[s][i] if i < len(split[s]) else "" for s in uniq}) > 1
@@ -482,8 +504,6 @@ def _variant_label_for_group(variant_sigs: list[str]) -> dict[str, str]:
             for i in differing
             if i < len(parts) and parts[i]
         ]
-        # Fallback: nothing varied (or fields were empty) — use the raw sig so
-        # the row is never left without a disambiguator.
         labels[s] = " ".join(tags) if tags else s
     return labels
 
@@ -499,12 +519,9 @@ def aggregate_by_kernel(
     _variant_split = not trace_dispatches
     _variant = _variant_sig if _variant_split else (lambda d: "")
 
-    # (kernel, sig, variant, rank) -> timing / counters / grbm / per-dispatch
     timing: dict[tuple[str, str, str, str], list[int]] = defaultdict(list)
     counters_by: dict[tuple[str, str, str, str], list[dict[str, float]]] = defaultdict(list)
     grbm_by: dict[tuple[str, str, str, str], list[tuple[float, int]]] = defaultdict(list)
-    # Per-dispatch (counters, duration_ns) pairs for population-consistent
-    # roofline metrics (see metrics._per_dispatch_roofline).
     disp_by: dict[tuple[str, str, str, str], list[tuple[dict[str, float], int]]] = defaultdict(list)
     agent_of: dict[tuple[str, str, str, str], str] = {}
 
@@ -561,7 +578,9 @@ def aggregate_by_kernel(
     return results
 
 
-def parse_shape_ranges(output_dir: str) -> list[ShapeMarker]:
+def parse_shape_ranges(
+    output_dir: str, *, process_id_overrides: dict[str, str] | None = None,
+) -> list[ShapeMarker]:
     """Read per-launch shape markers."""
     ranges: list[ShapeMarker] = []
     for f in _find_all_csvs(output_dir, "*marker_api_trace.csv"):
@@ -575,7 +594,7 @@ def parse_shape_ranges(output_dir: str) -> list[ShapeMarker]:
                     if not name.startswith("pl_shape_"):
                         continue
                     body = name[len("pl_shape_"):]
-                    # Kernel names may contain "__"; split at the last delimiter.
+                    # Kernel names may contain "__"; split at the last one.
                     stem, sep, sig = body.rpartition("__")
                     if not sep:
                         stem, sig = "", body
@@ -589,15 +608,16 @@ def parse_shape_ranges(output_dir: str) -> list[ShapeMarker]:
                         sig,
                         s,
                         e,
-                        process_id=(row.get("Process_Id") or row.get("Process_ID")
-                                    or row.get("process-id") or stem_pid),
+                        process_id=_csv_pid(row, stem_pid, process_id_overrides),
                     ))
         except OSError:
             continue
     return ranges
 
 
-def parse_graph_shape_ranges(output_dir: str) -> list[GraphShapeMarker]:
+def parse_graph_shape_ranges(
+    output_dir: str, *, process_id_overrides: dict[str, str] | None = None,
+) -> list[GraphShapeMarker]:
     """Read exact graph-node shape markers."""
     markers: list[GraphShapeMarker] = []
     prefix = "pl_graph_shape_"
@@ -620,8 +640,7 @@ def parse_graph_shape_ranges(output_dir: str) -> list[GraphShapeMarker]:
                     except (KeyError, ValueError):
                         continue
                     markers.append(GraphShapeMarker(
-                        process_id=str(row.get("Process_Id") or row.get("Process_ID")
-                                       or row.get("process-id") or stem_pid),
+                        process_id=_csv_pid(row, stem_pid, process_id_overrides),
                         kernel_key=key,
                         shape_sig=sig,
                         start_ns=start,
@@ -714,10 +733,8 @@ def _attribute_combined_shape_sigs(
                 return True
         return False
 
-    # owner id -> [(push_ns, sig)] in push order.
     seq: dict[tuple, list[tuple[int, str]]] = defaultdict(list)
     for marker in shape_markers or ():
-        # Preserve compatibility with legacy marker tuple forms.
         stem, sig, start, _end = marker[:4]
         process_id = str(
             getattr(marker, "process_id", "")
@@ -760,18 +777,16 @@ def _attribute_combined_shape_sigs(
             if graph_owner in seq:
                 found.append(graph_owner)
             elif global_graph_owner in seq:
-                # PID-less markers remain subject to the lane ambiguity check.
                 found.append(global_graph_owner)
         return found
 
-    # Merge marker namespaces that own the same dispatch.
     parent: dict[tuple, tuple] = {owner: owner for owner in seq}
 
     def _find(owner: tuple) -> tuple:
         root = owner
         while parent[root] != root:
             root = parent[root]
-        while parent[owner] != root:      # path compression
+        while parent[owner] != root:
             parent[owner], owner = root, parent[owner]
         return root
 
@@ -793,7 +808,7 @@ def _attribute_combined_shape_sigs(
         group = _find(owner)
         merged[group].extend(entries)
     for entries in merged.values():
-        entries.sort(key=lambda e: e[0])   # CPU push order == launch order
+        entries.sort(key=lambda e: e[0])
 
     sampled_ids = sorted({i for i in (sample_iteration_ids or ()) if i > 0})
 
@@ -847,12 +862,10 @@ def _attribute_combined_shape_sigs(
             }
             distinct_shapes = {sig for _push, sig in aligned_sequence}
             if len(lanes) > 1 and len(distinct_shapes) > 1:
-                # Multi-shape ordering is ambiguous across execution lanes.
                 continue
             for dispatch, (_push, sig) in zip(profiled, aligned_sequence):
                 sig_of[id(dispatch)] = sig
 
-    # Align the complete trace, then join sampled counters by dispatch identity.
     _align(trace_dispatches)
 
     sig_by_dispatch_id: dict[tuple[str, str, str, str, str], str] = {}
@@ -902,7 +915,6 @@ def _attribute_combined_shape_sigs(
             symbol_key,
         ))
         if not sig:
-            # Allow an unambiguous join when one CSV omits lane fields.
             sig = sig_without_queue.get((
                 dispatch.process_id,
                 dispatch_id,
@@ -912,8 +924,6 @@ def _attribute_combined_shape_sigs(
             sig_of[id(dispatch)] = sig
             joined.add(id(dispatch))
 
-    # Without a trace, counter rows are the launch-order source.  When dispatch
-    # sampling is active, apply the same per-kernel iteration IDs to markers.
     if not trace_dispatches:
         leftover = [d for d in counter_dispatches if id(d) not in joined]
     else:
@@ -954,7 +964,29 @@ def parse_and_aggregate(
     return _drop_unattributed_when_split(aggs)
 
 
-def parse_marker_ranges(output_dir: str) -> list[RegionMarker]:
+def aggregate_window_dispatches(
+    trace: list[KernelDispatch],
+    counters: list[KernelDispatch],
+    *,
+    markers: list[ShapeMarker] | None = None,
+    graph_markers: list[GraphShapeMarker] | None = None,
+    regions: list[RegionMarker] | None = None,
+) -> list[AggregatedKernel]:
+    """Aggregate an already validated window without reloading the capture CSVs."""
+    shape_of = None
+    if markers or graph_markers:
+        signatures = _attribute_combined_shape_sigs(
+            trace, counters, markers or [], graph_markers or [], regions or [],
+        )
+        shape_of = lambda dispatch: signatures.get(id(dispatch), "")  # noqa: E731
+    return _drop_unattributed_when_split(
+        aggregate_by_kernel(trace, counters, shape_of=shape_of),
+    )
+
+
+def parse_marker_ranges(
+    output_dir: str, *, process_id_overrides: dict[str, str] | None = None,
+) -> list[RegionMarker]:
     """Read the shim's per-scenario roctx ranges"""
     ranges: list[RegionMarker] = []
     for f in _find_all_csvs(output_dir, "*marker_api_trace.csv"):
@@ -976,8 +1008,7 @@ def parse_marker_ranges(output_dir: str) -> list[RegionMarker]:
                         name,
                         s,
                         e,
-                        process_id=(row.get("Process_Id") or row.get("Process_ID")
-                                    or row.get("process-id") or stem_pid),
+                        process_id=_csv_pid(row, stem_pid, process_id_overrides),
                     ))
         except OSError:
             continue
@@ -987,15 +1018,22 @@ def parse_marker_ranges(output_dir: str) -> list[RegionMarker]:
 def parse_and_aggregate_regions(
     output_dir: str,
     sample_iteration_ids: list[int] | tuple[int, ...] | None = None,
+    *,
+    process_id: str | None = None,
+    process_id_overrides: dict[str, str] | None = None,
 ) -> dict[str, list[AggregatedKernel]]:
     """Aggregate kernels per scenario range (``pl_region_<N>``)"""
-    ranges = parse_marker_ranges(output_dir)
+    ranges = parse_marker_ranges(output_dir, process_id_overrides=process_id_overrides)
     if not ranges:
         return {}
-    trace = parse_kernel_trace(output_dir)
-    counters = parse_counter_collection(output_dir)
-    markers = parse_shape_ranges(output_dir)
-    graph_markers = parse_graph_shape_ranges(output_dir)
+    trace = parse_kernel_trace(output_dir, process_id_overrides=process_id_overrides)
+    counters = parse_counter_collection(output_dir, process_id_overrides=process_id_overrides)
+    if process_id is not None:
+        ranges = [r for r in ranges if r.process_id == str(process_id)]
+        trace = [d for d in trace if d.process_id == str(process_id)]
+        counters = [d for d in counters if d.process_id == str(process_id)]
+    markers = parse_shape_ranges(output_dir, process_id_overrides=process_id_overrides)
+    graph_markers = parse_graph_shape_ranges(output_dir, process_id_overrides=process_id_overrides)
     shape_of = None
     if markers or graph_markers:
         sig_of = _attribute_combined_shape_sigs(

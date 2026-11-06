@@ -7,10 +7,21 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from profilelens.dtypes import QueryResult
+from profilelens.profile.kernel_names import add_canonical_aliases
+
+
+def kernel_time_share(row: dict[str, Any], total_kernel_ms: float) -> float:
+    """Preserve an upstream timing denominator when it supplied a percentage."""
+    if row.get("e2e_pct") is not None:
+        return round(float(row["e2e_pct"]), 1)
+    return (
+        round((row.get("total_ms", 0) or 0) / total_kernel_ms * 100.0, 1)
+        if total_kernel_ms > 0 else 0.0
+    )
 
 
 @dataclass
@@ -19,32 +30,14 @@ class KernelContext:
 
     kernel_name: str
     op: str = "unknown"
-    """Most-frequent CPU op (e.g., ``aten::mm``) that launched this kernel."""
-
     op_invocations: int = 0
-    """How many CPU op calls drove this kernel."""
-
     module: str = "unknown"
-    """Innermost ``nn.Module`` ancestor seen on the call stack."""
-
     shape: str = ""
-    """Most-frequent input-tensor shape signature, formatted ``[a,b,c]xN``."""
-
     avg_us: float = 0.0
-    """Average kernel duration in microseconds (from Phase 1 trace)."""
-
     total_ms: float = 0.0
-    """Total kernel time in milliseconds across all dispatches."""
-
     dispatch_count: int = 0
-    """Total number of kernel launches in Phase 1 trace."""
-
     e2e_pct: float = 0.0
-    """Percentage of total GPU time consumed by this kernel."""
-
     category: str = "unknown"
-    """Compute category (gemm, attention, normalization, ...)."""
-
 
 def _find_result(results: list[QueryResult], label: str) -> QueryResult | None:
     for r in results:
@@ -141,7 +134,6 @@ def build_kernel_dtype_from_trace(
 
     from profilelens.profile.dtype_detect import _lowest_precision_dtype
 
-    # cpu_op slice_id -> compute dtype = lowest-precision input operand
     sid_dtype: dict[int, str] = {}
     sid_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for row in types_q.rows:
@@ -170,7 +162,6 @@ def build_kernel_dtype_from_trace(
     }
 
 
-# Trace ``args.Input type`` strings (e.g. "c10::BFloat16") -> internal label.
 _TRACE_DTYPE_TO_INTERNAL: dict[str, str] = {
     "c10::BFloat16": "BF16", "BFloat16": "BF16",
     "c10::Half": "FP16", "Half": "FP16",
@@ -216,12 +207,11 @@ def build_kernel_context_map(
             avg_us=round((row.get("avg_ms", 0) or 0) * 1000.0, 2),
             total_ms=round(row.get("total_ms", 0) or 0, 3),
             dispatch_count=row.get("count", 0) or 0,
-            e2e_pct=round((row.get("total_ms", 0) or 0) / total_ms * 100.0, 1)
-                if total_ms > 0 else 0.0,
+            e2e_pct=kernel_time_share(row, total_ms),
         )
 
     if not (cpu_ext and gpu_ext and cpu_ext.rows and gpu_ext.rows):
-        return out
+        return add_canonical_aliases(out)
 
     kid_to_name: dict[int, str] = {}
     ext_to_kernel_names: dict[int, list[str]] = defaultdict(list)
@@ -272,4 +262,4 @@ def build_kernel_context_map(
             top_module, _ = max(module_counts.items(), key=lambda kv: kv[1])
             ctx.module = top_module
 
-    return out
+    return add_canonical_aliases(out)

@@ -21,11 +21,12 @@ Requires Python 3.10+.
 ### System Requirements
 
 - AMD GPU supported by the installed ROCm release
-- ROCm 7.x providing `rocprofv3` and `rocprofv3-avail` (HW counters)
+- ROCm providing `rocprofv3` and `rocprofv3-avail` (HW counters)
 - The GPU is auto-detected at runtime; no manual configuration needed
+- Optional: `llvm-cxxfilt` or `c++filt` to match mangled C++ kernel names
 
-ProfileLens currently includes a temporary, patched Linux x86-64
-`librocprofiler-sdk-tool.so` for ROCm 7.x. See
+ROCprofiler-SDK 1.4.1+ is used natively. Older ROCm 7.x installs use the
+bundled, temporary patched `librocprofiler-sdk-tool.so`; see
 [`rocprof-patch/7.x/README.md`](rocprof-patch/7.x/README.md) for its source,
 license, checksum, rebuild instructions, upstream status, and removal plan.
 
@@ -51,7 +52,9 @@ profilelens full-analysis \
   -- python my_workload.py
 ```
 
-The workload must have `torch.profiler` / kineto tracing enabled internally.
+The workload must have `torch.profiler` / kineto tracing enabled internally,
+and must join its worker processes before exiting so profiling output is flushed.
+
 ProfileLens will:
 
 1. Execute the workload (with a shim that hooks Pytorch profiler, triton launches and HIP/CUDA
@@ -66,7 +69,25 @@ ProfileLens will:
    consolidated report
 
 Useful options: `--top-k` (default 10), `--output-dir`,
-`--refresh-roofline` (force a fresh roofline benchmark measurement), `--output {rich,json,markdown}`.
+`--refresh-roofline` (force a fresh roofline benchmark measurement), `--output {rich,json,markdown}`,
+`--workload-timeout` (total seconds, default no limit), `--workload-idle-timeout`
+(stop after this many seconds without progress, default 1800).
+
+### Counter coverage
+
+Kernels whose dtype cannot be resolved are reported as `UNKNOWN`; they are never
+assigned another kernel's dtype or compute ceiling. Counter coverage can be steered
+without changing that attribution:
+
+```bash
+# Add MFMA counter families for these dtypes
+profilelens full-analysis --dtypes BF16,FP8,FP4 -- python my_workload.py
+
+# Or request exact counters (must fit in one pass; never silently dropped)
+profilelens full-analysis \
+  --counters SQ_INSTS_VALU_MFMA_MOPS_BF16,SQ_INSTS_VALU_MFMA_MOPS_F8 \
+  -- python my_workload.py
+```
 
 **Outputs** (saved to `--output-dir`):
 
@@ -76,6 +97,18 @@ Useful options: `--top-k` (default 10), `--output-dir`,
 | `report.json` | Structured JSON: kernel data, HW counters, per-dtype peaks, gap analysis |
 | `analysis.json` | Phase 1 Perfetto trace |
 | `roofline.png` | Roofline scatter of the top-K kernels |
+| `dtype_resolution.json` | Per-kernel dtype sources, unresolved kernels and counter coverage |
+
+### Configuration
+
+Set `PROFILELENS_HOME` to relocate the config file and roofline caches
+(default `~/.profilelens`).
+
+### Python capture API
+
+`profilelens.profile.capture` collects the trace and counters in a single workload
+run and analyzes saved windows without replay (`prepare_capture`,
+`build_capture_command`, `analyze_capture_window`). Requires ROCprofiler-SDK 1.4.1+.
 
 ---
 
@@ -136,6 +169,13 @@ Each profiled kernel's detail includes:
 - **Gap analysis**: deterministic hints from metric thresholds.
 - **Roofline chart** (`roofline.png`): kernels plotted against the HBM diagonal and
   one MFMA ceiling per observed dtype.
+
+Metric notes:
+
+- **FLOPs** = sum of collected floating-point MFMA families (512 ops per `MFMA_MOPS` unit).
+- **Memory traffic** comes from SDK `FETCH_SIZE`/`WRITE_SIZE` or DRAM request counters.
+- **Occupancy / VALU busy** use the SDK's `OccupancyPercent` / `VALUBusy`.
+- Missing counters are reported as `N/A` (`null` in JSON), never as zero.
 
 #### Report table shape
 
@@ -218,8 +258,8 @@ profilelens profile --from-analysis analysis.json --top-k 10 \
   --output-dir ./profilelens_run -- python my_workload.py
 ```
 
-Key options: `--kernel-names` (names/regexes), `--from-analysis`, `--top-k`,
-`--counter-set auto|custom`, `--counters`, `--run-roofline/--no-roofline`,
+Key options: `--kernel-names` (exact names), `--from-analysis`, `--trace`, `--top-k`,
+`--counter-set auto|custom`, `--counters`, `--dtypes`, `--run-roofline/--no-roofline`,
 `--refresh-roofline`, `--output {rich,json,markdown}`.
 
 ### Trace analysis — `analyze` / `query`
